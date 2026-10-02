@@ -1,0 +1,49 @@
+"""Картинки новых окошек (для проверки дизайна и инструкции): venv\\Scripts\\python tools\\overlay_shots.py <папка>"""
+import ctypes
+import sys
+import tkinter as tk
+from pathlib import Path
+
+ctypes.windll.shcore.SetProcessDpiAwareness(1)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from overlay_ui import DictationBubble, LectureBubble  # noqa: E402
+
+OUT = Path(sys.argv[1])
+OUT.mkdir(parents=True, exist_ok=True)
+root = tk.Tk()
+root.withdraw()
+scale = root.winfo_fpixels("1i") / 96
+
+
+def save(bubble, name):
+    bubble.render().save(OUT / f"{name}.png")
+    print("картинка:", name, flush=True)
+
+
+d = DictationBubble(root, scale)
+d.set_state("rec", "ru")
+d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал, сделай HTML-версию",
+           "очень красивую в стиле Apple")
+d.pulse = 1.0
+save(d, "7_bubble_dictation")
+d.set_text("", "", "Говорите…")
+save(d, "7b_bubble_empty")
+d.set_state("done")
+d.set_text("Добрый день! Высылаю отчёт по проекту, все цифры сверены.", "")
+save(d, "7c_bubble_done")
+
+lec = LectureBubble(root, scale, on_close=lambda: None, on_copy=lambda: None, on_open=lambda p: None)
+lec.src_title, lec.lang = "Лекция по ссылке", "en"
+lec.set_mode("Google")
+lec.set_hint("But what is a neural network? — обработано 4:12 из 18:39   ·   Alt+X — остановить и перевести")
+lec.listening("So the thing nobody tells you about building a company is that the first year is mostly about "
+              "learning what your customers actually want. We spent almost 8 months building features that "
+              "nobody used,", "and honestly that was painful")
+save(lec, "8_bubble_lecture")
+lec.done("So the thing nobody tells you about building a company is that the first year is mostly about learning "
+         "what your customers actually want. We spent almost 8 months building features that nobody used.",
+         "Итак, о создании компании никто не говорит вам, что первый год в основном посвящён изучению того, "
+         "чего на самом деле хотят ваши клиенты. Мы потратили почти 8 месяцев на создание функций, которыми "
+         "никто не пользовался.", "C:\\example.txt")
+save(lec, "9_bubble_translation")
+root.destroy()

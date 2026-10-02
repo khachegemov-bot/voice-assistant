@@ -1,0 +1,108 @@
+<div align="center">
+
+<img src="docs/logo.png" width="72" alt="logo">
+
+# Голосовой помощник
+
+**Диктовка, запись лекций и перевод английской речи на русский — прямо на компьютере, без подписок.**
+
+Windows 10/11 · Python · распознавание речи офлайн · горячие клавиши `Alt+Z` / `Alt+X`
+
+<img src="docs/shots/7_bubble_dictation.png" width="560" alt="Окошко диктовки">
+
+</div>
+
+> **English summary.** A Windows desktop voice assistant: press `Alt+Z` and speak — words appear live in a
+> floating overlay and are pasted where your cursor is. `Alt+X` transcribes an English lecture or podcast
+> (whole system audio, a single app, or a YouTube/Twitch link incl. live streams) and translates it into Russian.
+> Speech recognition runs **fully offline** (GigaAM v3 for Russian, NVIDIA Parakeet TDT for English, ONNX Runtime).
+
+---
+
+## Возможности
+
+### 🎙 Диктовка — `Alt+Z`
+- Говорите — слова появляются **по ходу речи** в компактном окошке внизу экрана: записанное — белым,
+  уточняющееся — серым, синяя точка — идёт запись.
+- Ещё раз `Alt+Z` — текст **вставляется туда, где стоит курсор** (Word, браузер, мессенджер…).
+- Язык — **автоматически по раскладке клавиатуры** (русская → русский, английская → английский).
+- Знаки препинания и заглавные буквы ставит сама модель; голосовые команды «новая строка», «новый абзац».
+- Если микрофон выключен в Windows (например, случайно клавишей на ноутбуке) — программа включит его сама.
+- История последних 10 диктовок; автосохранение черновика — текст не теряется даже при сбое.
+
+### 🎧 Лекции и подкасты — `Alt+X`
+| Источник | Как работает |
+|---|---|
+| **Весь звук** | всё, что играет на компьютере |
+| **Программа** | только одно приложение (Zoom, Teams, браузер) — можно параллельно смотреть своё видео в другой программе; лекцию можно приглушить «для себя», запись не страдает |
+| **Ссылка** | YouTube / VK Видео / Twitch: запись обрабатывается **быстрее реального времени** (19-минутная лекция ≈ 5 минут), прямой эфир — по ходу трансляции |
+
+Остановка — перевод **всего текста целиком** (онлайн через Google или полностью офлайн), оригинал рядом,
+всё сохраняется в «Документы → Голосовой помощник → Лекции».
+
+<div align="center">
+<img src="docs/shots/9_bubble_translation.png" width="620" alt="Перевод лекции">
+</div>
+
+### 🖥 Приложение
+<div align="center">
+<img src="docs/shots/1_dictation_tab.png" width="260" alt="Диктовка">
+<img src="docs/shots/2_lectures_tab.png" width="260" alt="Лекции">
+<img src="docs/shots/3_history_tab.png" width="260" alt="История">
+</div>
+
+---
+
+## Как это устроено
+
+- **Распознавание речи офлайн** — [GigaAM v3](https://github.com/salute-developers/GigaAM) (русский, с пунктуацией)
+  и [NVIDIA Parakeet TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (английский) в квантованном
+  int8-виде через [onnx-asr](https://github.com/istupakov/onnx-asr) / ONNX Runtime. Без GPU.
+- **Потоковое распознавание без потерь слов** — каждые ~0,5 с накопленный звук распознаётся заново, а засчитываются
+  только слова, совпавшие в двух распознаваниях подряд (подход *LocalAgreement*). Готовые фразы отрезаются по
+  времени слов, поэтому звук никогда не режется посреди слова. Короткие диктовки после «стоп» сверяются целиком.
+- **Звук одной программы** — WASAPI *process loopback* (`ActivateAudioInterfaceAsync`, `VAD\Process_Loopback`)
+  через `comtypes`; захват идёт в отдельном процессе, чтобы тяжёлые вычисления не мешали забирать звук
+  из 10-мс буфера Windows.
+- **Ссылки и прямые эфиры** — `yt-dlp` + PyAV (FFmpeg), автопереподключение при обрыве эфира.
+- **Перевод** — Google (онлайн, абзацами с контекстом) или [OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT)
+  через CTranslate2 (офлайн).
+- **Интерфейс** — главное окно на CustomTkinter; всплывающие окна рисуются Pillow со сглаживанием и тенью и
+  показываются через *layered windows* Windows (`UpdateLayeredWindow`) — с попиксельной прозрачностью, без
+  перехвата фокуса.
+- Системные горячие клавиши `RegisterHotKey` (работают при любой раскладке), иконка в трее, автозапуск,
+  сборка в один `.exe`-каталог через PyInstaller.
+
+| Файл | Что внутри |
+|---|---|
+| `app.py` | приложение: распознавание, диктовка, лекции, перевод, окно, горячие клавиши |
+| `overlay_ui.py` | всплывающие окна на layered windows |
+| `process_audio.py` | захват звука одной программы (WASAPI process loopback) |
+| `launcher.pyw` | перезапуск после сбоя |
+| `tools/` | загрузка моделей, снимки экрана, сборка инструкции |
+
+---
+
+## Запуск из исходников
+
+```bash
+python -m venv venv
+venv\Scripts\pip install -r requirements.txt
+venv\Scripts\python tools\download_models.py      # ≈1,1 ГБ моделей в папку models/
+venv\Scripts\pythonw app.py
+```
+
+Сборка `.exe`:
+
+```bash
+venv\Scripts\pyinstaller voice_assistant.spec      # результат — dist\Голосовой помощник\
+```
+
+Подробная инструкция для пользователей — [`Инструкция.html`](Инструкция.html).
+
+---
+
+## Лицензии моделей
+
+GigaAM v3 — MIT · NVIDIA Parakeet TDT 0.6B v2 — CC-BY-4.0 · OPUS-MT — CC-BY-4.0.
+Код проекта — [MIT](LICENSE).
