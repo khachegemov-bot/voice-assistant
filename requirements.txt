@@ -5,6 +5,7 @@ onnxruntime==1.23.2
 ctranslate2==4.8.2
 sentencepiece==0.2.2
 sounddevice==0.5.6
+soxr==1.1.0
 SoundCard==0.4.6
 pycaw==20260927
 comtypes==1.4.17

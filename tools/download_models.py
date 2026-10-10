@@ -3,6 +3,7 @@
 • GigaAM v3 e2e RNNT int8 (русский, Сбер, MIT)                 — Hugging Face istupakov/gigaam-v3-onnx
 • NVIDIA Parakeet TDT 0.6B v2 int8 (английский, CC-BY-4.0)     — Hugging Face istupakov/parakeet-tdt-0.6b-v2-onnx
 • OPUS-MT en→ru (офлайн-перевод, CC-BY-4.0)                     — пакет Argos Translate
+• Silero VAD (определение речи, MIT)                            — Hugging Face istupakov/silero-vad-onnx
 
 Более сильная офлайн-модель перевода (OPUS-MT tc-big) собирается конвертацией и требует PyTorch:
   pip install transformers torch sacremoses
@@ -25,6 +26,7 @@ ASR = {
                            ["config.json", "v3_e2e_rnnt_*.int8.onnx", "v3_e2e_rnnt_vocab.txt"]),
     "nemo-parakeet-tdt-0.6b-v2": ("istupakov/parakeet-tdt-0.6b-v2-onnx",
                                   ["config.json", "*.int8.onnx", "vocab.txt"]),
+    "silero-vad": ("istupakov/silero-vad-onnx", ["silero_vad.onnx"]),
 }
 ARGOS_EN_RU = "https://argos-net.com/v1/translate-en_ru-1_9.argosmodel"
 

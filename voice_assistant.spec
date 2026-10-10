@@ -6,6 +6,7 @@ import os  # noqa: E402
 # модели: русский, английский и офлайн-перевод (tc-big, если собран, иначе OPUS-MT из Argos)
 datas = [(f"models/{m}", f"models/{m}") for m in ("gigaam-v3-e2e-rnnt", "nemo-parakeet-tdt-0.6b-v2")]
 datas.append(("models/tcbig", "models/tcbig") if os.path.isdir("models/tcbig") else ("models/en_ru", "models/en_ru"))
+datas.append(("models/silero-vad", "models/silero-vad"))
 datas += collect_data_files("onnx_asr")
 datas += collect_data_files("soundcard")
 datas += collect_data_files("customtkinter")       # темы и шрифты нового интерфейса
@@ -21,7 +22,7 @@ a = Analysis(
     pathex=["."],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["process_audio", "overlay_ui", "pystray._win32", "pycaw.pycaw", "comtypes.stream", "soundcard.mediafoundation",
+    hiddenimports=["process_audio", "overlay_ui", "audio_input", "soxr", "pystray._win32", "pycaw.pycaw", "comtypes.stream", "soundcard.mediafoundation",
                    "darkdetect"],
     excludes=["torch", "torchaudio", "transformers", "gigaam", "faster_whisper", "matplotlib", "pandas", "IPython",
               "hydra", "omegaconf", "pydub", "tensorflow", "noisereduce", "keyboard", "PyQt5", "PySide6",

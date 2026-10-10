@@ -157,7 +157,7 @@ class Settings(dict):
     def __init__(self):
         super().__init__({"lang": "auto", "paste": True, "overlay": True, "tr_online": True,
                           "src": "system", "src_app": "", "duck": True, "lec_lang": "en", "link": "",
-                          "mic": "", "auto_unmute": True})
+                          "mic": "", "auto_unmute": True, "keep_recordings": True})
         self.update(load_json(self.FILE, {}))
 
     def set(self, key, value):
@@ -326,13 +326,36 @@ class Recognizers:
                 self.on_status(None)
             return self.models[lang]
 
+    vad = None              # Silero VAD (задаёт App): громкость подстраиваем по голосу, а не по щелчкам
+    VOICE_GATE = False      # приглушать отрезки без голоса — на проверке ухудшило точность (срезает края слов)
+
+    def prepare(self, audio: np.ndarray) -> np.ndarray:
+        """Громкость для распознавания. Раньше подстраивалась по самому громкому месту — щелчок клавиши
+        оказывался громче тихого голоса, и голос оставался тихим. Теперь — по голосу (Silero VAD)."""
+        if not len(audio):
+            return audio
+        mask = None
+        if self.vad is not None and len(audio) >= RATE // 4:
+            from audio_input import speech_mask
+            mask = speech_mask(self.vad.probs(audio), len(audio), pad=0.3)
+            if not mask.any():
+                mask = None
+        if mask is not None:
+            voice_rms = rms(audio[mask])
+            gain = min(0.08 / max(voice_rms, 1e-6), 40)          # голос → комфортный уровень
+            if self.VOICE_GATE:
+                ramp = np.convolve(mask.astype(np.float32), np.ones(800) / 800, "same")   # плавно, без щелчков
+                audio = audio * (0.15 + 0.85 * ramp)                # без голоса — тише в ~7 раз
+        else:
+            peak = np.percentile(np.abs(audio), 99.9)
+            gain = min(0.5 / peak, 50) if peak > 0 else 1.0
+        out = audio * gain
+        return (np.tanh(out * 1.2) / 1.2).astype(np.float32)          # мягкий ограничитель вместо обрезания
+
     def recognize_words(self, lang: str, audio: np.ndarray) -> list[tuple[str, float]]:
         """Распознаёт звук и возвращает слова с временем начала каждого (в секундах)."""
         self.get(lang)
-        audio = highpass(audio)
-        peak = np.percentile(np.abs(audio), 99.9) if len(audio) else 0
-        if peak > 0:
-            audio = audio * min(0.5 / peak, 50)       # тихий звук — усиливаем
+        audio = self.prepare(highpass(audio))
         r = self.ts_models[lang].recognize(audio, sample_rate=RATE)
         return tokens_to_words(r.tokens or [], r.timestamps or [])
 
@@ -358,6 +381,8 @@ class StreamRecognizer:
         self.levels: deque = deque(maxlen=300)
         self.keep_all = False                         # хранить весь звук записи (для итоговой сверки)
         self.all_audio: list = []
+        self.vad = None                               # Silero VAD (поток): отличает голос от шума
+        self.voice_since_step = False                 # был ли голос с прошлого шага
 
     def feed(self, audio: np.ndarray):
         if len(audio):
@@ -365,8 +390,12 @@ class StreamRecognizer:
             self.levels.append(rms(audio))
             if self.keep_all:
                 self.all_audio.append(audio)
+            if self.vad is not None and max(self.vad.feed(audio) or [0.0]) >= 0.5:
+                self.voice_since_step = True
 
     def _quiet(self, audio: np.ndarray) -> bool:
+        if self.vad is not None:                      # нейросеть: голос — по звучанию, а не по громкости
+            return not self.voice_since_step
         noise = float(np.percentile(self.levels, 10)) * 2.5 if len(self.levels) > 20 else 0.0
         return rms(audio) < max(self.floor, noise)
 
@@ -392,6 +421,7 @@ class StreamRecognizer:
         if len(self.buf) - self.decoded < self.STEP * RATE:
             return
         quiet = self._quiet(self.buf[self.decoded:])
+        self.voice_since_step = False
         if quiet and not self.prev:                   # тишина и дописывать нечего — не тратим процессор
             self.buf = self.buf[-RATE // 2:]
             self.decoded = len(self.buf)
@@ -786,8 +816,10 @@ class Dictation:
                                            "(клавиша с микрофоном на ноутбуке) и не занят другой программой.")
 
         try:
-            with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=int(RATE * 0.05),
-                                device=mic_device(self.app.settings.get("mic", "")), callback=callback):
+            from audio_input import MicStream
+            name = self.app.settings.get("mic", "")
+            with MicStream(name, lambda block: callback(block[:, None]), mme_device=mic_device(name)) as mic:
+                log("микрофон:", mic.mode)
                 while self.active and self.session == session:
                     time.sleep(0.03)
         except Exception as e:
@@ -810,12 +842,20 @@ class Dictation:
         sr = StreamRecognizer(self.app.asr, lang, on_commit,
                               lambda live: self.app.ui("dict_update", text, live), floor=1e-4)
         sr.keep_all = True
+        if self.app.vad is not None:
+            sr.vad = self.app.vad.new_stream()
         sr.STEP = 0.5          # диктовке — обновляем чаще (куски не укорачиваем: иначе рвутся предложения)
         # первые 0,45 с — звук колокольчика из динамиков, пропускаем
         run_stream(q, sr, alive=lambda: True, skip_samples=int(RATE * 0.45))
 
         final = self._final_pass(lang, sr.all_audio, text.strip()) if sr.will_final_pass() else text.strip()
         clear_draft()
+        if self.app.settings.get("keep_recordings", True) and sr.all_audio:
+            try:                                        # последние 5 записей — для проверки качества (только локально)
+                from audio_input import save_recording
+                save_recording(DATA_DIR / "recordings", np.concatenate(sr.all_audio), final)
+            except Exception as e:
+                log("!! запись для проверки:", e)
         if final:
             self.app.history.add(final, lang)
             if self.app.settings["paste"] and not foreground_is_ours():
@@ -831,6 +871,9 @@ class Dictation:
             return streamed
         audio = np.concatenate(parts)
         if rms(audio) < 1e-4:                         # тишина — распознавать нечего
+            return streamed
+        if self.app.vad is not None and not streamed and self.app.vad.probs(audio).max() < 0.5:
+            log("итоговая сверка: голоса не слышно — пропускаю")
             return streamed
         self.app.ui("dict_update", streamed, "")
         try:
@@ -972,6 +1015,8 @@ class LectureListener:
         threading.Thread(target=feed_audio, args=(q, session), daemon=True, name="lecture-audio").start()
         sr = StreamRecognizer(self.app.asr, self.lang, on_commit,
                               lambda live: self.app.ui("pod_update", text, live), floor=3e-4)
+        if getattr(self.app, "vad", None) is not None:
+            sr.vad = self.app.vad.new_stream()          # голос, а не музыка и шумы — по звучанию
         run_stream(q, sr, alive=lambda: self._running(session))
         return text
 
@@ -1485,6 +1530,14 @@ class App:
         root.bind_all("<MouseWheel>", self._wheel, add="+")   # «+» — не мешаем прокрутке истории
 
         self.asr = Recognizers(lambda msg: self.ui("loading", msg))
+        self.vad = None
+        try:
+            from audio_input import SileroVAD
+            vad_path = MODELS_DIR / "silero-vad" / "silero_vad.onnx"
+            if vad_path.exists():
+                self.vad = SileroVAD(vad_path)
+        except Exception as e:
+            log("!! Silero VAD не загрузился — определяю речь по громкости:", e)
         self.translator = Translator(lambda msg: self.ui("tr_note", msg))
         self.dictation = Dictation(self)
         self.podcast = LectureListener(self)
