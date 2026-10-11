@@ -22,7 +22,7 @@ a = Analysis(
     pathex=["."],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["process_audio", "overlay_ui", "audio_input", "soxr", "pystray._win32", "pycaw.pycaw", "comtypes.stream", "soundcard.mediafoundation",
+    hiddenimports=["process_audio", "overlay_ui", "audio_input", "ui_main", "soxr", "pystray._win32", "pycaw.pycaw", "comtypes.stream", "soundcard.mediafoundation",
                    "darkdetect"],
     excludes=["torch", "torchaudio", "transformers", "gigaam", "faster_whisper", "matplotlib", "pandas", "IPython",
               "hydra", "omegaconf", "pydub", "tensorflow", "noisereduce", "keyboard", "PyQt5", "PySide6",

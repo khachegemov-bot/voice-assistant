@@ -15,19 +15,29 @@ root.withdraw()
 scale = root.winfo_fpixels("1i") / 96
 
 
+def settle(bubble, frames: int = 25):
+    """Прокрутить анимацию (проявление слов, высоту окна) до конца, как это происходит на экране."""
+    import time
+    for _ in range(frames):
+        bubble.animate()
+        bubble.render()
+        time.sleep(0.033)
+
+
 def save(bubble, name):
+    settle(bubble)
     bubble.render().save(OUT / f"{name}.png")
     print("картинка:", name, flush=True)
 
 
 d = DictationBubble(root, scale)
+_levels = iter([0.002, 0.004, 0.03, 0.06, 0.05, 0.08, 0.04] * 40)
+d.level_source = lambda: next(_levels, 0.05)
 d.set_state("rec", "ru")
+d.set_ready()
 d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал, сделай HTML-версию",
            "очень красивую в стиле Apple")
-d.pulse = 1.0
 save(d, "7_bubble_dictation")
-d.set_text("", "", "Говорите…")
-save(d, "7b_bubble_empty")
 d.set_state("done")
 d.set_text("Добрый день! Высылаю отчёт по проекту, все цифры сверены.", "")
 save(d, "7c_bubble_done")

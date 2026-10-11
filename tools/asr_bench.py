@@ -63,7 +63,8 @@ def wer(ref: str, hyp: str) -> float:
 class FakeApp:
     def __init__(self):
         self.asr = A.Recognizers(lambda m: None)
-        self.settings = {"paste": False, "mic": "", "keep_recordings": False}
+        self.settings = {"paste": False, "mic": "", "keep_recordings": False, "lang": "ru"}
+        self.stats = type("S", (), {"add": lambda *a: None})()
         self.vad = None
         self.history = type("H", (), {"add": lambda *a: None})()
         self.done = threading.Event()

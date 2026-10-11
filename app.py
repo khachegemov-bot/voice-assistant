@@ -74,14 +74,13 @@ import faulthandler
 if sys.stderr is not None:
     faulthandler.enable(file=sys.stderr, all_threads=True)
 
-import tkinter as tk
-from tkinter import font as tkfont
 
 import customtkinter as ctk
 
 import ctranslate2
 import numpy as np
 import onnx_asr
+import onnxruntime as ort
 import pyperclip
 import pystray
 import sentencepiece as spm
@@ -91,6 +90,7 @@ from PIL import Image, ImageDraw
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
+APP_VERSION = "1.2.0"
 RATE = 16000
 HISTORY_MAX = 10
 
@@ -121,13 +121,13 @@ LANG_NAMES = {"ru": "Русский", "en": "English"}
 MIC_DEFAULT = "По умолчанию (как в Windows)"
 
 C = {   # тёмная тема в духе Apple: чистый чёрный, графитовые карточки, системный синий и зелёный
-    "bg": "#000000", "surface": "#1c1c1e", "surface2": "#2c2c2e", "border": "#2c2c2e",
+    "bg": "#0b0b0d", "surface": "#1c1c1e", "surface2": "#2c2c2e", "border": "#2c2c2e",
     "card": "#1c1c1e", "card2": "#2c2c2e",
     "text": "#f5f5f7", "muted": "#8e8e93", "accent": "#0a84ff", "accent_hover": "#0071e3",
     "accent_text": "#64a8ff", "rec": "#ff453a", "rec_hover": "#e0372d", "chip": "#2c2c2e",
     "chip_hover": "#3a3a3c", "ok": "#30d158", "blue": "#64d2ff", "blue_btn": "#5e5ce6",
     "blue_btn_hover": "#4f4dd6", "seg_sel": "#636366", "seg_sel_hover": "#6e6e73", "switch_on": "#30d158",
-    "ov_bg": "#15161b", "ov_text": "#f4f4f6", "ov_old": "#a3a7b3", "ov_muted": "#6f7482",
+    "side": "#141416", "line": "#232326", "nav_sel": "#2c2c2e", "nav_hover": "#1f1f22", "muted2": "#636366",
 }
 UI_FONT = "Segoe UI Variable Display"            # шрифт Windows 11; если его нет — обычный Segoe UI
 
@@ -204,6 +204,39 @@ class History:
         save_json(self.FILE, self.items)
 
 
+class Stats:
+    """Сколько надиктовано: слов сегодня, всего, сколько это сэкономило времени (только на этом компьютере)."""
+    FILE = DATA_DIR / "stats.json"
+    TYPE_WPM, SPEAK_WPM = 40, 130            # обычная скорость печати и речи, слов в минуту
+
+    def __init__(self):
+        d = load_json(self.FILE, {})
+        self.days: dict = d.get("days", {})
+        self.words: int = d.get("words", 0)
+        self.sessions: int = d.get("sessions", 0)
+
+    def add(self, text: str):
+        n = len(re.findall(r"\w+", text))
+        if not n:
+            return
+        today = dt.date.today().isoformat()
+        self.days[today] = self.days.get(today, 0) + n
+        for old in sorted(self.days)[:-60]:      # храним два месяца
+            del self.days[old]
+        self.words += n
+        self.sessions += 1
+        try:
+            save_json(self.FILE, {"days": self.days, "words": self.words, "sessions": self.sessions})
+        except Exception as e:
+            log("!! статистика:", e)
+
+    def today(self) -> int:
+        return self.days.get(dt.date.today().isoformat(), 0)
+
+    def saved_minutes(self) -> float:
+        return self.words / self.TYPE_WPM - self.words / self.SPEAK_WPM
+
+
 # ─────────────────────────── звук ───────────────────────────
 
 def make_chime(path: Path, notes: list[float], gap: float = 0.12, length: float = 1.1, volume: float = 0.14):
@@ -270,6 +303,19 @@ def join_to_previous(text: str, prev: str) -> str:
     return text[0].lower() + text[1:]
 
 
+def append_piece(text: str, piece: str, lang: str = "", commands: bool = True) -> str:
+    """Дописать засчитанный кусок к тексту. Если модель поставила точку на паузе, а следующий кусок
+    продолжает фразу со строчной буквы («удали файл. который…») — точка лишняя, меняем её на запятую."""
+    piece = join_to_previous(piece, text)
+    tail = text.rstrip()
+    if tail.endswith(".") and not tail.endswith("..") and piece[:1].islower():
+        text = tail[:-1] + ","
+    if commands and lang:
+        piece = apply_commands(piece, lang)
+    sep = "" if not text or text.endswith("\n") else " "
+    return text + sep + piece
+
+
 def is_filler(text: str) -> bool:
     """«А-а-а», «Ммм», «Угу», «Uh», «Hmm» без настоящих слов — не печатаем."""
     words = re.findall(r"\w+", text.lower())
@@ -306,6 +352,8 @@ def tokens_to_words(tokens: list[str], times: list[float]) -> list[tuple[str, fl
 class Recognizers:
     """Модели распознавания, загружаются при первом использовании."""
 
+    THREADS = 3
+
     def __init__(self, on_status):
         self.models: dict = {}
         self.ts_models: dict = {}
@@ -319,10 +367,19 @@ class Recognizers:
                 name, quant = ASR_MODELS[lang]
                 t = time.time()
                 local = MODELS_DIR / name                     # в .exe модели лежат внутри сборки
+                # 3 потока: у процессоров ноутбуков (2 быстрых ядра + 8 экономных) это в 2–3 раза быстрее,
+                # чем «все ядра» по умолчанию — экономные ядра тормозят общую работу
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = self.THREADS
+                opts.inter_op_num_threads = 1
                 self.models[lang] = onnx_asr.load_model(name, str(local) if local.is_dir() else None,
-                                                        quantization=quant)
+                                                        quantization=quant, sess_options=opts)
                 self.ts_models[lang] = self.models[lang].with_timestamps()
-                log(f"модель {name} загружена за {time.time() - t:.1f} с")
+                # первое распознавание после загрузки в несколько раз медленнее (ONNX готовит вычисления) —
+                # делаем его сразу, чтобы первая диктовка не «подвисала»
+                warm = np.random.default_rng(0).normal(0, 0.01, RATE * 2).astype(np.float32)
+                self.ts_models[lang].recognize(warm, sample_rate=RATE)
+                log(f"модель {name} загружена и прогрета за {time.time() - t:.1f} с")
                 self.on_status(None)
             return self.models[lang]
 
@@ -352,12 +409,42 @@ class Recognizers:
         out = audio * gain
         return (np.tanh(out * 1.2) / 1.2).astype(np.float32)          # мягкий ограничитель вместо обрезания
 
-    def recognize_words(self, lang: str, audio: np.ndarray) -> list[tuple[str, float]]:
-        """Распознаёт звук и возвращает слова с временем начала каждого (в секундах)."""
+    def recognize(self, lang: str, audio: np.ndarray) -> tuple[list[tuple[str, float]], float]:
+        """Слова с временем начала каждого (в секундах) и уверенность модели (средний log-prob, ≤ 0)."""
         self.get(lang)
         audio = self.prepare(highpass(audio))
         r = self.ts_models[lang].recognize(audio, sample_rate=RATE)
-        return tokens_to_words(r.tokens or [], r.timestamps or [])
+        lp = getattr(r, "logprobs", None) or []
+        return tokens_to_words(r.tokens or [], r.timestamps or []), (float(np.mean(lp)) if lp else -9.0)
+
+    def recognize_words(self, lang: str, audio: np.ndarray) -> list[tuple[str, float]]:
+        return self.recognize(lang, audio)[0]
+
+    LANG_MARGIN = 0.05       # насколько одна модель должна быть увереннее другой, чтобы сменить язык
+
+    def detect_lang(self, audio: np.ndarray, guess: str, known: dict | None = None) -> tuple[str | None, dict]:
+        """Язык речи по самому голосу: обе модели распознают один и тот же звук, побеждает более уверенная.
+        Русская модель, слыша английскую речь, пишет латиницей — это тоже верный признак.
+        Возвращает (язык или None — «пока непонятно», результаты обеих моделей)."""
+        res = dict(known or {})
+        for lang in ("ru", "en"):
+            if lang not in res:
+                res[lang] = self.recognize(lang, audio)
+        (ru_words, ru_lp), (en_words, en_lp) = res["ru"], res["en"]
+        if not ru_words and not en_words:
+            return None, res
+        if not en_words:
+            return "ru", res
+        if not ru_words:
+            return "en", res
+        letters = re.findall(r"[^\W\d_]", " ".join(w for w, _ in ru_words))
+        if letters and sum(ch.isascii() for ch in letters) / len(letters) > 0.5:
+            return "en", res
+        if en_lp - ru_lp > self.LANG_MARGIN:
+            return "en", res
+        if ru_lp - en_lp > self.LANG_MARGIN:
+            return "ru", res
+        return None, res
 
 
 class StreamRecognizer:
@@ -383,6 +470,9 @@ class StreamRecognizer:
         self.all_audio: list = []
         self.vad = None                               # Silero VAD (поток): отличает голос от шума
         self.voice_since_step = False                 # был ли голос с прошлого шага
+        self.voice_samples = 0                        # сколько всего звучал голос
+        self.detect = False                           # «Авто»: язык ещё уточняется по голосу
+        self.on_lang = lambda lang: None
 
     def feed(self, audio: np.ndarray):
         if len(audio):
@@ -390,8 +480,11 @@ class StreamRecognizer:
             self.levels.append(rms(audio))
             if self.keep_all:
                 self.all_audio.append(audio)
-            if self.vad is not None and max(self.vad.feed(audio) or [0.0]) >= 0.5:
-                self.voice_since_step = True
+            if self.vad is not None:
+                voiced = sum(p >= 0.5 for p in self.vad.feed(audio))
+                if voiced:
+                    self.voice_since_step = True
+                    self.voice_samples += voiced * 512
 
     def _quiet(self, audio: np.ndarray) -> bool:
         if self.vad is not None:                      # нейросеть: голос — по звучанию, а не по громкости
@@ -400,11 +493,37 @@ class StreamRecognizer:
         return rms(audio) < max(self.floor, noise)
 
     def _recognize(self, audio):
+        return self._recognize_lp(audio)[0]
+
+    def _recognize_lp(self, audio):
         try:
-            return self.asr.recognize_words(self.lang, audio)
+            return self.asr.recognize(self.lang, audio)
         except Exception as e:
             log("!! распознавание:", e)
-            return []
+            return [], -9.0
+
+    def _check_lang(self, words, lp, quiet: bool) -> tuple[list, bool]:
+        """«Авто»: сверяем язык по голосу, пока он не ясен. Возвращает (слова, можно ли засчитывать)."""
+        heard = self.voice_samples / RATE
+        if not words or (heard < 0.8 and not quiet):
+            return words, False                       # мало голоса — ждём, ничего не засчитываем
+        try:
+            lang, res = self.asr.detect_lang(self.buf, self.lang, {self.lang: (words, lp)})
+        except Exception as e:
+            log("!! определение языка:", e)
+            self.detect = False
+            return words, True
+        final = heard >= 3 or quiet
+        if lang is None and not final:
+            return words, False                       # обе модели одинаково уверены — слушаем дальше
+        self.detect = False
+        if lang and lang != self.lang:
+            log(f"язык по голосу: {LANG_NAMES[lang]} (а не {LANG_NAMES[self.lang]})")
+            self.lang = lang
+            self.prev = []                            # устойчивость слов считаем заново — другая модель
+            self.on_lang(lang)
+            return res[lang][0], False
+        return words, True
 
     def _emit(self, words):
         text = " ".join(w for w, _ in words).strip()
@@ -426,7 +545,10 @@ class StreamRecognizer:
             self.buf = self.buf[-RATE // 2:]
             self.decoded = len(self.buf)
             return
-        words = self._recognize(self.buf)
+        words, lp = self._recognize_lp(self.buf)
+        may_commit = True
+        if self.detect:
+            words, may_commit = self._check_lang(words, lp, quiet)
         self.decoded = len(self.buf)
         dur = len(self.buf) / RATE
 
@@ -449,6 +571,8 @@ class StreamRecognizer:
                     break
         if not upto and dur > self.MAX_BUFFER and stable > 3:
             upto = stable - 2
+        if not may_commit:
+            upto = 0
 
         if upto:
             rest = words[upto:]
@@ -468,9 +592,9 @@ class StreamRecognizer:
             if not words and dur > 5:                 # долго ничего не распознаётся — шум/музыка
                 self.buf = self.buf[-RATE:]
                 self.decoded = len(self.buf)
-        self.on_live(" ".join(w for w, _ in self.prev))
+        self.on_live(re.sub(r"[.…]+$", "", " ".join(w for w, _ in self.prev)))
 
-    FINAL_PASS_MAX = 10      # запись не длиннее — после «стоп» распознаётся заново целиком (итоговая сверка)
+    FINAL_PASS_MAX = 45      # запись не длиннее — после «стоп» распознаётся заново (итоговая сверка, ≤ ~3 с)
 
     def will_final_pass(self) -> bool:
         return self.keep_all and sum(map(len, self.all_audio)) <= RATE * self.FINAL_PASS_MAX
@@ -489,6 +613,22 @@ class StreamRecognizer:
         self.buf = np.zeros(0, np.float32)
         self.prev = []
         self.on_live("")
+
+
+def split_at_pauses(audio: np.ndarray, min_s: float = 12, max_s: float = 20) -> list[np.ndarray]:
+    """Длинный звук → куски по min_s…max_s секунд, разрезанные в самом тихом месте (между словами)."""
+    parts, pos = [], 0
+    while len(audio) - pos > max_s * RATE:
+        lo, hi = pos + int(min_s * RATE), pos + int(max_s * RATE)
+        win = audio[lo:hi]
+        n = len(win) // 480
+        levels = np.sqrt(np.mean(win[:n * 480].reshape(n, 480) ** 2, axis=1))
+        levels = np.convolve(levels, np.ones(10) / 10, "same")
+        end = lo + int(np.argmin(levels)) * 480 + 240
+        parts.append(audio[pos:end])
+        pos = end
+    parts.append(audio[pos:])
+    return parts
 
 
 def run_stream(audio_q: queue.Queue, sr: StreamRecognizer, alive, skip_samples: int = 0):
@@ -603,12 +743,19 @@ def paste(text: str):
         old = pyperclip.paste()
     except Exception:
         old = None
+    # Alt ещё зажат после Alt+Z — тогда Ctrl+V превратится в Ctrl+Alt+V (у части раскладок это AltGr:
+    # напечатается лишний символ). Ждём, пока отпустят Alt/Shift/Win (не дольше 1,5 с)
+    end = time.time() + 1.5
+    while time.time() < end and any(user32.GetAsyncKeyState(k) & 0x8000 for k in (0x12, 0x10, 0x5B, 0x5C)):
+        time.sleep(0.03)
     pyperclip.copy(text)
     time.sleep(0.05)
     kb = user32.keybd_event                         # Ctrl+V по кодам клавиш — не зависит от раскладки
     kb(0x11, 0, 0, 0); kb(0x56, 0, 0, 0); kb(0x56, 0, 2, 0); kb(0x11, 0, 2, 0)
-    time.sleep(0.2)
-    if old is not None:
+    # браузеры, Telegram, Discord читают буфер не мгновенно — вернём старый буфер чуть позже,
+    # иначе вместо диктовки вставится то, что было в буфере раньше
+    time.sleep(0.6)
+    if old:                                         # пустой буфер (или картинка) — не затираем
         pyperclip.copy(old)
 
 
@@ -784,14 +931,22 @@ def make_icon(recording: bool = False, size: int = 256) -> Image.Image:
 class Dictation:
     """Микрофон → потоковое распознавание → живой текст в окошке → вставка по окончании."""
 
+    CHIME = 0.45            # столько звучит сигнал «начали» — его не записываем
+
     def __init__(self, app: "App"):
         self.app = app
         self.active = False
         self.session = 0
+        self.level = 0.0                    # громкость микрофона сейчас — для индикатора в окошке
+        self.listen_from = 0.0
 
     def start(self, lang: str):
         self.active = True
         self.session += 1
+        self.level = 0.0
+        # Сигнал начинает звучать в момент нажатия, а микрофон открывается ~0,5 с — отсекаем звук
+        # по часам (раньше отсекали 0,45 с от открытия микрофона и теряли начало речи)
+        self.listen_from = time.time() + self.CHIME
         q: queue.Queue = queue.Queue()
         threading.Thread(target=self._capture, args=(q, self.session), daemon=True).start()
         threading.Thread(target=self._process, args=(q, lang), daemon=True).start()
@@ -804,7 +959,12 @@ class Dictation:
         heard = {"samples": 0, "peak": 0.0, "warned": False}
 
         def callback(data, *_):
+            if time.time() < self.listen_from:
+                return                                # ещё звучит сигнал «начали»
             block = data[:, 0].copy()
+            if not heard["samples"]:
+                self.app.ui("dict_ready")             # микрофон слушает — можно говорить
+            self.level = rms(block)
             q.put(block)
             heard["samples"] += len(block)
             heard["peak"] = max(heard["peak"], float(np.abs(block).max()))
@@ -828,45 +988,64 @@ class Dictation:
         q.put(None)
 
     def _process(self, q: queue.Queue, lang: str):
-        text = ""
+        text, live = "", ""
+        sr = None
+        final = ""
+        try:
+            def on_commit(piece: str):
+                # на экран — вместе с живым хвостом в on_live (раньше хвост на миг пропадал и печатался заново)
+                nonlocal text
+                text = append_piece(text, piece, sr.lang)
+                log("»", piece)
+                save_draft(text, sr.lang)             # автосохранение: при сбое текст не пропадёт
 
-        def on_commit(piece: str):
-            nonlocal text
-            piece = apply_commands(join_to_previous(piece, text), lang)
-            sep = "" if not text or text.endswith("\n") else " "
-            text += sep + piece
-            log("»", piece)
-            save_draft(text, lang)                    # автосохранение: при сбое текст не пропадёт
-            self.app.ui("dict_update", text, "")
+            def on_live(tail: str):
+                nonlocal live
+                live = tail
+                self.app.ui("dict_update", text, tail)
 
-        sr = StreamRecognizer(self.app.asr, lang, on_commit,
-                              lambda live: self.app.ui("dict_update", text, live), floor=1e-4)
-        sr.keep_all = True
-        if self.app.vad is not None:
-            sr.vad = self.app.vad.new_stream()
-        sr.STEP = 0.5          # диктовке — обновляем чаще (куски не укорачиваем: иначе рвутся предложения)
-        # первые 0,45 с — звук колокольчика из динамиков, пропускаем
-        run_stream(q, sr, alive=lambda: True, skip_samples=int(RATE * 0.45))
-
-        final = self._final_pass(lang, sr.all_audio, text.strip()) if sr.will_final_pass() else text.strip()
+            sr = StreamRecognizer(self.app.asr, lang, on_commit, on_live, floor=1e-4)
+            sr.keep_all = True
+            if self.app.vad is not None:
+                sr.vad = self.app.vad.new_stream()
+                sr.detect = self.app.settings.get("lang") == "auto"     # язык — по голосу
+                sr.on_lang = lambda new: self.app.ui("dict_lang", new)
+            sr.STEP = 0.5          # диктовке — обновляем чаще (куски не укорачиваем: иначе рвутся предложения)
+            run_stream(q, sr, alive=lambda: True)
+            if sr.will_final_pass():
+                final = self._final_pass(sr, text.strip(), live)
+            else:
+                final = text.strip()
+        except Exception as e:                          # что бы ни случилось — текст не теряем
+            log("!! диктовка:", e)
+            import traceback
+            traceback.print_exc()
+            final = (text + (" " + live if live else "")).strip()
+        lang = sr.lang if sr is not None else lang
         clear_draft()
-        if self.app.settings.get("keep_recordings", True) and sr.all_audio:
+        if self.app.settings.get("keep_recordings", True) and sr is not None and sr.all_audio:
             try:                                        # последние 5 записей — для проверки качества (только локально)
                 from audio_input import save_recording
                 save_recording(DATA_DIR / "recordings", np.concatenate(sr.all_audio), final)
             except Exception as e:
                 log("!! запись для проверки:", e)
-        if final:
-            self.app.history.add(final, lang)
-            if self.app.settings["paste"] and not foreground_is_ours():
-                paste(final + " ")
+        try:
+            if final:
+                self.app.history.add(final, lang)
+                self.app.stats.add(final)
+                if self.app.settings["paste"] and not foreground_is_ours():
+                    paste(final + " ")
+        except Exception as e:
+            log("!! вставка:", e)
         self.app.ui("dict_done", final)
 
-    def _final_pass(self, lang: str, parts: list, streamed: str) -> str:
-        """Итоговая сверка короткой диктовки: целиком модель видит всю фразу сразу — точнее знаки
-        препинания, заглавные буквы и слова на стыках кусков. Хвост записи потоковое распознавание
+    def _final_pass(self, sr: "StreamRecognizer", streamed: str, live: str = "") -> str:
+        """Итоговая сверка: после «стоп» вся запись распознаётся заново (длинная — кусками по 12–20 с,
+        разрезанными в паузах). Модель видит фразы целиком — точнее знаки препинания, заглавные буквы
+        и слова на стыках, где потоковое распознавание резало звук. Хвост записи потоковое распознавание
         в этом случае не дораспознаёт — его распознаёт именно сверка. Если она вдруг дала заметно
         меньше слов, чем потоковое, — оставляем потоковое."""
+        parts = sr.all_audio
         if not parts:
             return streamed
         audio = np.concatenate(parts)
@@ -875,13 +1054,26 @@ class Dictation:
         if self.app.vad is not None and not streamed and self.app.vad.probs(audio).max() < 0.5:
             log("итоговая сверка: голоса не слышно — пропускаю")
             return streamed
-        self.app.ui("dict_update", streamed, "")
+        self.app.ui("dict_update", streamed, live)     # живой хвост остаётся на экране, пока идёт сверка
         try:
             t = time.time()
-            words = self.app.asr.recognize_words(lang, audio)
-            text = " ".join(w for w, _ in words).strip()
-            text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
-            text = apply_commands(re.sub(r"(\w)—", r"\1 —", text), lang)
+            pieces = split_at_pauses(audio)
+            first = None
+            if sr.detect:                             # короткая фраза — язык ещё не определён
+                lang, res = self.app.asr.detect_lang(pieces[0], sr.lang)
+                if lang and lang != sr.lang:
+                    log(f"язык по голосу: {LANG_NAMES[lang]}")
+                    sr.lang = lang
+                    self.app.ui("dict_lang", lang)
+                    streamed = ""                     # потоковый текст был на другом языке
+                first = res[sr.lang][0]
+            text = ""
+            for i, part in enumerate(pieces):
+                words = first if i == 0 and first is not None else self.app.asr.recognize_words(sr.lang, part)
+                piece = " ".join(w for w, _ in words).strip()
+                piece = re.sub(r"(\w)—", r"\1 —", re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece))
+                if piece and not is_filler(piece):
+                    text = append_piece(text, piece, sr.lang)
         except Exception as e:
             log("!! итоговая сверка:", e)
             return streamed
@@ -1008,8 +1200,7 @@ class LectureListener:
         def on_commit(piece: str):
             nonlocal text
             log("LEC»", piece)
-            text += (" " if text else "") + join_to_previous(piece, text)
-            self.app.ui("pod_update", text, "")
+            text = append_piece(text, piece, commands=False)
 
         q: queue.Queue = queue.Queue()
         threading.Thread(target=feed_audio, args=(q, session), daemon=True, name="lecture-audio").start()
@@ -1193,7 +1384,7 @@ class LectureListener:
                 piece = " ".join(w for w, _ in words).strip()
                 piece = re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece)
                 if piece and not is_filler(piece):
-                    text += (" " if text else "") + join_to_previous(piece, text)
+                    text = append_piece(text, piece, commands=False)
             pos = end
             spent = time.time() - started
             left = spent / max(pos, 1) * (len(audio) - pos)
@@ -1203,280 +1394,13 @@ class LectureListener:
         return text
 
 
-# ─────────────────────────── всплывающие окошки ───────────────────────────
-
-class Floating:
-    """Окошко поверх всех окон: без рамки, скруглённое, не забирает фокус (текст
-    продолжает печататься туда, где был курсор). Можно перетаскивать мышкой."""
-
-    def __init__(self, root: tk.Tk, width: int):
-        self.root = root
-        self.width = width
-        self.win = w = tk.Toplevel(root)
-        w.overrideredirect(True)
-        w.attributes("-topmost", True)                # непрозрачное: полупрозрачность даёт артефакты
-        w.configure(bg=C["ov_bg"])
-        w.update_idletasks()
-        self.hwnd = user32.GetParent(w.winfo_id())
-        ex = user32.GetWindowLongW(self.hwnd, -20)
-        user32.SetWindowLongW(self.hwnd, -20, ex | 0x08000000 | 0x80 | 0x8)   # NOACTIVATE | TOOLWINDOW | TOPMOST
-        dwm(self.hwnd, 33, 2)                       # скруглённые углы Windows 11
-        dwm(self.hwnd, 34, 0x00372D2A)              # тонкая рамка в цвет темы (#2a2d37, формат BGR)
-        self.pos = None                             # позиция после перетаскивания
-        self._drag = None
-        self._hide_job = None
-        self.visible = True
-        self.hide()
-
-    def draggable(self, *widgets):
-        for wd in widgets:
-            wd.bind("<ButtonPress-1>", self._drag_start, add="+")
-            wd.bind("<B1-Motion>", self._drag_move, add="+")
-
-    def _drag_start(self, e):
-        self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y())
-
-    def _drag_move(self, e):
-        if self._drag:
-            x, y = e.x_root - self._drag[0], e.y_root - self._drag[1]
-            self.pos = (x, y)
-            self.win.geometry(f"+{x}+{y}")
-
-    def place(self, bottom_offset: int):
-        """Ставим окно внизу по центру. Размер не задаём — его подбирает tkinter по содержимому
-        (если задавать размер вручную, tkinter не успевает перерисовывать содержимое)."""
-        self.win.update_idletasks()
-        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        if self.pos:
-            x, y = self.pos
-        else:
-            l, t, r, b = work_area()
-            x, y = (l + r - w) // 2, b - h - bottom_offset
-        self.win.geometry(f"+{x}+{y}")
-
-    def show(self):
-        # показываем средствами tkinter (иначе он не перерисовывает содержимое);
-        # фокус не отбирается благодаря стилю WS_EX_NOACTIVATE
-        self.cancel_hide()
-        if not self.visible:
-            self.win.deiconify()
-            self.visible = True
-        user32.SetWindowPos(self.hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)   # поверх всех, без активации
-
-    def hide(self):
-        self.cancel_hide()
-        if self.visible:
-            self.win.withdraw()
-            self.visible = False
-
-    def hide_later(self, ms: int):
-        self.cancel_hide()
-        self._hide_job = self.win.after(ms, self.hide)
-
-    def cancel_hide(self):
-        if self._hide_job:
-            self.win.after_cancel(self._hide_job)
-            self._hide_job = None
-
-
-def text_widget(parent, font: tkfont.Font, width_px: int, **kw) -> tk.Text:
-    """Текстовое поле фиксированной ширины (в знаках) — высоту окна tkinter подбирает сам."""
-    opts = dict(bg=C["ov_bg"], fg=C["ov_text"], font=font, wrap="word", bd=0, highlightthickness=0,
-                height=1, width=max(10, width_px // max(1, font.measure("0"))), padx=0, pady=0,
-                cursor="arrow", insertwidth=0, spacing1=1, spacing3=1)
-    opts.update(kw)
-    t = tk.Text(parent, **opts)
-    t.configure(state="disabled")
-    return t
-
-
-def display_lines(t: tk.Text) -> int:
-    t.update_idletasks()
-    n = t.count("1.0", "end", "update", "displaylines")    # update — досчитать переносы строк сейчас же
-    n = n[0] if isinstance(n, tuple) else (n or 1)
-    return max(1, n)
-
-
-class DictationPill(Floating):
-    """Маленькая тёмная «таблетка» внизу экрана: точка записи, ваши слова, кнопка стоп."""
-    MAX_LINES = 6
-
-    def __init__(self, root, scale, fonts, on_stop, on_fix=None):
-        super().__init__(root, int(560 * scale))
-        box = tk.Frame(self.win, bg=C["ov_bg"], padx=int(14 * scale), pady=int(10 * scale))
-        box.pack(fill="both", expand=True)
-        d = int(12 * scale)
-        self.dot = tk.Canvas(box, width=d, height=d, bg=C["ov_bg"], highlightthickness=0)
-        self.dot_id = self.dot.create_oval(1, 1, d - 1, d - 1, fill=C["rec"], outline="")
-        self.dot.pack(side="left", anchor="n", pady=(int(6 * scale), 0), padx=(0, int(10 * scale)))
-        right = tk.Frame(box, bg=C["ov_bg"])
-        right.pack(side="right", anchor="n", padx=(int(10 * scale), 0))
-        self.lang = tk.Label(right, text="RU", bg=C["chip"], fg=C["ov_old"], font=fonts["tiny"],
-                             padx=int(6 * scale), pady=1)
-        self.lang.pack(side="left", pady=(int(3 * scale), 0))
-        self.stop = tk.Label(right, text="■", bg=C["ov_bg"], fg=C["rec"], font=fonts["norm"], cursor="hand2",
-                             padx=int(8 * scale))
-        self.stop.pack(side="left")
-        self.stop.bind("<Button-1>", lambda e: on_stop())
-        # кнопка «Включить» — появляется, только когда микрофон выключен в Windows
-        self.fix = tk.Label(right, text="", bg=C["accent"], fg="white", font=fonts["tiny_b"], cursor="hand2",
-                            padx=int(8 * scale), pady=int(2 * scale))
-        self.fix.bind("<Button-1>", lambda e: on_fix and on_fix())
-        font, wrap = fonts["ov"], int(440 * scale)
-        self.max_chars = int(wrap / font.measure("о") * 0.92) * self.MAX_LINES   # примерно 6 строк
-        self.label = tk.Label(box, text="", bg=C["ov_bg"], fg=C["ov_text"], font=font, justify="left",
-                              anchor="nw", wraplength=wrap, width=max(10, wrap // font.measure("0")))
-        self.label.pack(side="left", anchor="n")
-        self.draggable(box, self.dot, self.label)
-        self.state = "idle"
-        self._pulse_on = True
-        self._pulse()
-
-    def _pulse(self):
-        if self.state == "rec":
-            self._pulse_on = not self._pulse_on
-            self.dot.itemconfigure(self.dot_id, fill=C["rec"] if self._pulse_on else "#7f1d1d")
-        self.win.after(550, self._pulse)
-
-    def set_state(self, state: str, lang: str = ""):
-        self.state = state
-        colors = {"rec": C["rec"], "busy": C["blue"], "done": C["ok"]}
-        self.dot.itemconfigure(self.dot_id, fill=colors.get(state, C["ov_muted"]))
-        self.stop.configure(text="■" if state == "rec" else "")
-        if lang:
-            self.lang.configure(text=lang.upper())
-
-    def set_text(self, committed: str, live: str = "", placeholder: str = ""):
-        text = (committed + (" " if committed and live and not committed.endswith("\n") else "") + live).strip()
-        if not text:
-            self.label.configure(text=placeholder, fg=C["ov_muted"])
-            return
-        if len(text) > self.max_chars:                      # длинный текст — показываем последние строки
-            text = "…" + text[-self.max_chars:].split(" ", 1)[-1]
-        self.label.configure(text=text, fg=C["ov_text"])
-
-    def relayout(self, bottom_offset: int):
-        self.place(bottom_offset)
-
-
-class PodcastPanel(Floating):
-    """Окно подкаста. Пока слушаем — английский текст вживую; после остановки —
-    перевод всего текста и оригинал под ним. Остаётся на экране, пока не закроете ✕."""
-
-    def __init__(self, root, scale, fonts, on_close, on_copy):
-        super().__init__(root, int(660 * scale))
-        s = scale
-        head = tk.Frame(self.win, bg=C["ov_bg"], padx=int(16 * s), pady=int(9 * s))
-        head.pack(fill="x")
-        self.title = tk.Label(head, text="", bg=C["ov_bg"], fg=C["blue"], font=fonts["tiny_b"])
-        self.title.pack(side="left")
-        self.mode = tk.Label(head, text="", bg=C["ov_bg"], fg=C["ov_muted"], font=fonts["tiny"])
-        self.mode.pack(side="left", padx=(int(8 * s), 0))
-        close = tk.Label(head, text="✕", bg=C["ov_bg"], fg=C["ov_muted"], font=fonts["norm"], cursor="hand2")
-        close.pack(side="right")
-        close.bind("<Button-1>", lambda e: on_close())
-        self.copy = tk.Label(head, text="", bg=C["ov_bg"], fg=C["accent"], font=fonts["tiny_b"], cursor="hand2")
-        self.copy.pack(side="right", padx=(0, int(14 * s)))
-        self.copy.bind("<Button-1>", lambda e: self.copy["text"] and on_copy())
-        self.open = tk.Label(head, text="", bg=C["ov_bg"], fg=C["accent"], font=fonts["tiny_b"], cursor="hand2")
-        self.open.pack(side="right", padx=(0, int(14 * s)))
-        self.open.bind("<Button-1>", lambda e: self.path and os.startfile(self.path))
-        body = tk.Frame(self.win, bg=C["ov_bg"], padx=int(16 * s))
-        body.pack(fill="both", expand=True, pady=(0, int(8 * s)))
-        self.text = text_widget(body, fonts["ov_big"], int(620 * s), spacing3=int(4 * s))
-        self.text.tag_configure("main", foreground=C["ov_text"])
-        self.text.tag_configure("live", foreground=C["ov_old"])
-        self.text.tag_configure("label", foreground=C["ov_muted"], font=fonts["tiny_b"], spacing1=int(10 * s))
-        self.text.tag_configure("orig", foreground=C["ov_old"], font=fonts["ov_small_n"])
-        self.text.tag_configure("ph", foreground=C["ov_muted"])
-        self.text.pack(fill="both", expand=True)
-        self.hint = tk.Label(self.win, text="", bg=C["ov_bg"], fg=C["ov_muted"], font=fonts["tiny"],
-                             anchor="w", padx=int(16 * s), pady=int(0))
-        self.hint.pack(fill="x", pady=(0, int(10 * s)))
-        self.draggable(head, self.title)
-        self.state = "idle"
-        self.follow = True
-        self.max_lines = 8
-        self.ru = ""
-        self.path = ""
-        self.src_title = "Слушаю"
-        self.lang = "en"
-
-    def set_mode(self, text: str):
-        self.mode.configure(text=text)
-
-    def _fill(self, parts: list[tuple[str, str]]):
-        t = self.text
-        t.configure(state="normal")
-        t.delete("1.0", "end")
-        for text, tag in parts:
-            t.insert("end", text, tag)
-        t.configure(state="disabled")
-
-    def listening(self, en: str, live: str):
-        self.state, self.max_lines = "listening", 8
-        self.title.configure(text=f"●  {self.src_title}  ·  {self.lang.upper()}", fg=C["rec"])
-        self.copy.configure(text="")
-        self.open.configure(text="")
-        if en or live:
-            self._fill([(en, "main"), ((" " if en and live else "") + live, "live")])
-        else:
-            self._fill([("Жду речь — слова появятся здесь…", "ph")])
-
-    def translating(self, en: str):
-        self.state = "translating"
-        self.title.configure(text="◌  Перевожу…" if self.lang == "en" else "◌  Сохраняю…", fg=C["blue"])
-        self.hint.configure(text="")
-        self._fill([(en, "live")])
-
-    def done(self, en: str, ru: str, path: str = ""):
-        self.state, self.max_lines = "done", 12
-        self.follow = False
-        self.ru = ru or en                                # что копировать
-        self.path = path
-        if ru:
-            self.title.configure(text="✓  Перевод  EN → RU", fg=C["ok"])
-            self.copy.configure(text="Копировать перевод")
-            self._fill([(ru, "main"), ("\nОРИГИНАЛ\n", "label"), (en, "orig")])
-        else:
-            self.title.configure(text="✓  Текст лекции", fg=C["ok"])
-            self.copy.configure(text="Копировать текст")
-            self._fill([(en, "main")])
-        self.open.configure(text="Открыть файл" if path else "")
-        self.hint.configure(text="Сохранено в «Документы → Голосовой помощник → Лекции»   ·   Alt+X — снова"
-                            if path else "Alt+X — слушать снова")
-        self.text.yview_moveto(0)
-
-    def relayout(self, bottom_offset: int):
-        n = display_lines(self.text)
-        self.text.configure(height=min(max(n, 2), self.max_lines))
-        if self.follow:
-            self.text.see("end")
-        self.place(bottom_offset)
-
-
 # ─────────────────────────── главное окно ───────────────────────────
-
-class HoverButton(tk.Label):
-    """Плоская кнопка с подсветкой при наведении."""
-
-    def __init__(self, parent, text, command, bg, hover, fg="white", **kw):
-        super().__init__(parent, text=text, bg=bg, fg=fg, cursor="hand2", **kw)
-        self.colors = [bg, hover]
-        self.command = command
-        self.bind("<Enter>", lambda e: self.configure(bg=self.colors[1]))
-        self.bind("<Leave>", lambda e: self.configure(bg=self.colors[0]))
-        self.bind("<Button-1>", lambda e: self.command())
-
-    def set_colors(self, bg, hover, fg=None):
-        self.colors = [bg, hover]
-        self.configure(bg=bg, **({"fg": fg} if fg else {}))
-
 
 class App:
     def __init__(self, start_hidden: bool):
         self.settings = Settings()
         self.history = History()
+        self.stats = Stats()
         draft = load_json(DRAFT_FILE, None)           # программа упала посреди диктовки — спасаем текст
         self.recovered = bool(draft and draft.get("text", "").strip())
         if self.recovered:
@@ -1497,37 +1421,26 @@ class App:
         self.scale = root.winfo_fpixels("1i") / 96
         root.title(APP_TITLE)
         root.configure(fg_color=C["bg"])
-        root.geometry("540x680")                 # CustomTkinter сам учитывает масштаб экрана
-        root.minsize(460, 560)
+        root.geometry("980x680")                 # CustomTkinter сам учитывает масштаб экрана
+        root.minsize(860, 580)
         ico = DATA_DIR / "icon.ico"
         make_icon().save(ico, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
         root.iconbitmap(default=str(ico))
         root.after(300, lambda: root.iconbitmap(str(ico)))   # CustomTkinter ставит свою иконку — меняем обратно
         root.protocol("WM_DELETE_WINDOW", self.hide_window)
-        f = "Segoe UI"
-        self.fonts = {
-            "h1": tkfont.Font(family=f + " Semibold", size=16),
-            "big": tkfont.Font(family=f + " Semibold", size=12),
-            "norm": tkfont.Font(family=f, size=10),
-            "bold": tkfont.Font(family=f + " Semibold", size=10),
-            "small": tkfont.Font(family=f, size=9),
-            "tiny": tkfont.Font(family=f, size=8),
-            "tiny_b": tkfont.Font(family=f + " Semibold", size=8),
-            "ov": tkfont.Font(family=f, size=12),
-            "ov_big": tkfont.Font(family=f, size=13),
-            "ov_small": tkfont.Font(family=f, size=10, slant="italic"),
-            "ov_small_n": tkfont.Font(family=f, size=10),
-        }
         self._build()
         root.update_idletasks()
-        dwm(user32.GetParent(root.winfo_id()), 20, 1)          # тёмный заголовок окна
+        hwnd = user32.GetParent(root.winfo_id())
+        dwm(hwnd, 20, 1)                                      # тёмный заголовок окна
+        r_, g_, b_ = (int(C["bg"][i:i + 2], 16) for i in (1, 3, 5))
+        dwm(hwnd, 35, r_ | g_ << 8 | b_ << 16)                # заголовок — цвета окна (Windows 11), без «шва»
 
         from overlay_ui import DictationBubble, LectureBubble
         self.pill = DictationBubble(root, self.scale)
+        self.pill.level_source = lambda: self.dictation.level
         self.pod_closed = False
         self.panel = LectureBubble(root, self.scale, on_close=lambda: self.ui("close_panel"),
                                    on_copy=lambda: self.ui("copy_translation"), on_open=os.startfile)
-        root.bind_all("<MouseWheel>", self._wheel, add="+")   # «+» — не мешаем прокрутке истории
 
         self.asr = Recognizers(lambda msg: self.ui("loading", msg))
         self.vad = None
@@ -1589,134 +1502,199 @@ class App:
 
     def _section(self, parent, title: str, hint: str = "") -> ctk.CTkFrame:
         box = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=18, border_width=0)
-        box.pack(fill="x", pady=(0, 10))
+        box.pack(fill="x", pady=(0, 12))
         inner = ctk.CTkFrame(box, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=14)
-        self._label(inner, title, 14, bold=True).pack(fill="x")
+        inner.pack(fill="x", padx=20, pady=16)
+        self._label(inner, title, 15, bold=True).pack(fill="x")
         if hint:
-            self._label(inner, hint, 12, C["muted"], wrap=420).pack(fill="x", pady=(2, 0))
+            self._label(inner, hint, 12, C["muted"], wrap=620).pack(fill="x", pady=(3, 0))
         body = ctk.CTkFrame(inner, fg_color="transparent")
-        body.pack(fill="x", pady=(10, 0))
+        body.pack(fill="x", pady=(12, 0))
         return body
 
-    def _switch(self, parent, text: str, key: str) -> ctk.CTkSwitch:
-        sw = ctk.CTkSwitch(parent, text=text, font=self._font(13), text_color=C["text"],
-                           progress_color=C["switch_on"], button_color="#ffffff", button_hover_color="#f2f2f7",
-                           fg_color=C["chip_hover"], command=lambda: self._flip(key), switch_width=40,
-                           switch_height=22)
-        sw.pack(fill="x", pady=4)
+    def _switch(self, parent, text: str, key: str, hint: str = "") -> ctk.CTkSwitch:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=5)
+        sw = ctk.CTkSwitch(row, text="", progress_color=C["switch_on"], button_color="#ffffff",
+                           button_hover_color="#f2f2f7", fg_color=C["chip_hover"], command=lambda: self._flip(key),
+                           switch_width=42, switch_height=24, width=48)
+        sw.pack(side="right")
+        col = ctk.CTkFrame(row, fg_color="transparent")
+        col.pack(side="left", fill="x", expand=True)
+        self._label(col, text, 13).pack(fill="x")
+        if hint:
+            self._label(col, hint, 11, C["muted"], wrap=520).pack(fill="x")
         sw.key = key
         return sw
 
+    def _glyph(self, key: str, color: str, size: int = 18) -> ctk.CTkImage:
+        from ui_main import ICONS, icon_font
+        big = size * 4
+        img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        ImageDraw.Draw(img).text((big / 2, big / 2), ICONS[key], font=icon_font(int(big * 0.78)), fill=color,
+                                 anchor="mm")
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+    def _page(self, key: str, title: str, subtitle: str = ""):
+        pg = ctk.CTkScrollableFrame(self.main, fg_color="transparent", scrollbar_button_color=C["surface2"],
+                                    scrollbar_button_hover_color=C["chip_hover"])
+        self.pages[key] = pg
+        head = ctk.CTkFrame(pg, fg_color="transparent")
+        head.pack(fill="x", pady=(0, 18))
+        left = ctk.CTkFrame(head, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True)
+        title_lbl = self._label(left, title, 28, bold=True)
+        title_lbl.pack(anchor="w")
+        if subtitle:
+            self._label(left, subtitle, 13, C["muted"]).pack(anchor="w", pady=(2, 0))
+        pg.title_lbl = title_lbl
+        return pg, head
+
+    def show_page(self, key: str):
+        self.page = key
+        for k, pg in self.pages.items():
+            pg.pack_forget()
+            b = self.nav[k]
+            sel = k == key
+            b.configure(fg_color=C["nav_sel"] if sel else "transparent", text_color=C["text"] if sel else C["muted"],
+                        image=b.icons[sel])
+        self.pages[key].pack(fill="both", expand=True, padx=(26, 14), pady=(20, 12))
+        if key == "home":
+            self.render_home()
+
     def _build(self):
+        from ui_main import Hero, ICONS
         r = self.root
-        outer = ctk.CTkFrame(r, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=20, pady=(16, 14))
+        self.pages: dict = {}
+        self.nav: dict = {}
 
-        # — шапка —
-        head = ctk.CTkFrame(outer, fg_color="transparent")
-        head.pack(fill="x")
-        self._logo = ctk.CTkImage(make_icon(size=96), size=(38, 38))
-        ctk.CTkLabel(head, image=self._logo, text="").pack(side="left", padx=(0, 12))
-        titles = ctk.CTkFrame(head, fg_color="transparent")
-        titles.pack(side="left")
-        self._label(titles, APP_TITLE, 20, bold=True).pack(anchor="w")
-        self._label(titles, "Диктовка, лекции и перевод", 12, C["muted"]).pack(anchor="w")
-        self.status = ctk.CTkLabel(head, text="", font=self._font(12, True), corner_radius=10, height=28,
-                                   fg_color=C["surface2"], text_color=C["ok"], padx=12)
-        self.status.pack(side="right")
+        # ── боковое меню ──
+        side = ctk.CTkFrame(r, width=236, fg_color=C["side"], corner_radius=0)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        ctk.CTkFrame(r, width=1, fg_color=C["line"], corner_radius=0).pack(side="left", fill="y")
+        self.main = ctk.CTkFrame(r, fg_color=C["bg"], corner_radius=0)
+        self.main.pack(side="left", fill="both", expand=True)
 
-        # — главная кнопка —
-        self.rec_btn = ctk.CTkButton(outer, text="", command=self.toggle_record, height=58, corner_radius=16,
-                                     font=self._font(17, True), fg_color=C["accent"],
-                                     hover_color=C["accent_hover"])
-        self.rec_btn.pack(fill="x", pady=(16, 12))
+        brand = ctk.CTkFrame(side, fg_color="transparent")
+        brand.pack(fill="x", padx=18, pady=(20, 22))
+        self._logo = ctk.CTkImage(make_icon(size=96), size=(36, 36))
+        ctk.CTkLabel(brand, image=self._logo, text="").pack(side="left", padx=(0, 11))
+        names = ctk.CTkFrame(brand, fg_color="transparent")
+        names.pack(side="left")
+        self._label(names, "Голосовой", 15, bold=True).pack(anchor="w")
+        self._label(names, "помощник", 15, bold=True).pack(anchor="w", pady=(0, 0))
 
-        # — вкладки —
-        tabs = ctk.CTkTabview(outer, fg_color=C["bg"], corner_radius=14,
-                              segmented_button_fg_color=C["surface"],
-                              segmented_button_selected_color=C["seg_sel"],
-                              segmented_button_selected_hover_color=C["seg_sel_hover"],
-                              segmented_button_unselected_color=C["surface"],
-                              segmented_button_unselected_hover_color=C["surface2"],
-                              text_color=C["text"], anchor="w")
-        tabs.pack(fill="both", expand=True)
-        tabs._segmented_button.configure(font=self._font(13, True), height=34)
-        t_dict, t_lec, t_hist = tabs.add("Диктовка"), tabs.add("Лекции"), tabs.add("История")
-        self.tabs = tabs
-        # содержимое вкладок прокручивается колесом мыши, если не помещается по высоте
-        scroll = dict(fg_color="transparent", scrollbar_button_color=C["surface2"],
-                      scrollbar_button_hover_color=C["chip_hover"])
-        t_dict = ctk.CTkScrollableFrame(t_dict, **scroll)
-        t_dict.pack(fill="both", expand=True)
-        t_lec = ctk.CTkScrollableFrame(t_lec, **scroll)
-        t_lec.pack(fill="both", expand=True)
+        for key, label in (("home", "Главная"), ("lecture", "Лекции"), ("history", "История"),
+                           ("settings", "Настройки")):
+            icons = (self._glyph(key, C["muted"]), self._glyph(key, "#ffffff"))
+            b = ctk.CTkButton(side, text="  " + label, image=icons[0], compound="left", anchor="w", height=40,
+                              corner_radius=10, font=self._font(14, True), fg_color="transparent",
+                              hover_color=C["nav_hover"], text_color=C["muted"],
+                              command=lambda k=key: self.show_page(k))
+            b.icons = icons
+            b.pack(fill="x", padx=12, pady=2)
+            self.nav[key] = b
 
-        # ── Диктовка ──
-        s = self._section(t_dict, "Язык диктовки")
-        self.lang_seg = self._seg(s, [("auto", "Авто · по раскладке"), ("ru", "Русский"), ("en", "English")],
+        bottom = ctk.CTkFrame(side, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", padx=18, pady=18)
+        keys = ctk.CTkFrame(bottom, fg_color=C["surface"], corner_radius=14)
+        keys.pack(fill="x", pady=(0, 12))
+        for combo, what in (("Alt + Z", "диктовка"), ("Alt + X", "лекция")):
+            row = ctk.CTkFrame(keys, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(10 if combo == "Alt + Z" else 0, 10 if combo == "Alt + X" else 4))
+            ctk.CTkLabel(row, text=combo, font=self._font(12, True), fg_color=C["surface2"], corner_radius=7,
+                         text_color=C["text"], height=24, width=64).pack(side="left")
+            self._label(row, what, 12, C["muted"]).pack(side="left", padx=(10, 0))
+        self.status = ctk.CTkLabel(bottom, text="", font=self._font(12, True), anchor="w", text_color=C["ok"])
+        self.status.pack(fill="x", padx=4)
+
+        # ── Главная ──
+        pg, head = self._page("home", self._greeting(), "Всё распознаётся на этом ноутбуке — без интернета")
+        self.home_title = pg.title_lbl
+        self.hero = Hero(pg, self.scale, bg=C["bg"], colors=("#1d4ed8", "#7c3aed"), glyph=ICONS["mic"],
+                         accent="#2563eb", eyebrow="Диктовка", title="Говорите — я напишу",
+                         subtitle="Нажмите Alt+Z в любом окне и говорите. Ещё раз Alt+Z — текст встанет туда, "
+                                  "где курсор.", hotkey="Alt + Z", command=self.toggle_record,
+                         level_source=lambda: self.dictation.level, ui_font=UI_FONT)
+        self.hero.pack(fill="x")
+        stats = ctk.CTkFrame(pg, fg_color="transparent")
+        stats.pack(fill="x", pady=(14, 12))
+        self.stat_labels = {}
+        for i, (key, title) in enumerate((("today", "Слов сегодня"), ("total", "Слов всего"),
+                                          ("saved", "Сэкономлено времени"))):
+            stats.grid_columnconfigure(i, weight=1, uniform="stats")
+            card = ctk.CTkFrame(stats, fg_color=C["surface"], corner_radius=18)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0 if i == 2 else 6))
+            self._label(card, title, 12, C["muted"]).pack(anchor="w", padx=18, pady=(16, 0))
+            value = self._label(card, "0", 30, bold=True)
+            value.pack(anchor="w", padx=18)
+            sub = self._label(card, "", 12, C["muted"])
+            sub.pack(anchor="w", padx=18, pady=(0, 16))
+            self.stat_labels[key] = (value, sub)
+        s = self._section(pg, "Язык диктовки", "«Авто» — язык определяется по голосу: говорите по-русски "
+                                               "или по-английски, раскладку переключать не нужно.")
+        self.lang_seg = self._seg(s, [("auto", "Авто · по голосу"), ("ru", "Русский"), ("en", "English")],
                                   self.set_lang)
         self.lang_seg.pack(fill="x")
-        s = self._section(t_dict, "Микрофон", "Если есть гарнитура — её микрофон обычно слышит чище встроенного.")
-        row = ctk.CTkFrame(s, fg_color="transparent")
-        row.pack(fill="x")
-        self.mic_menu = ctk.CTkOptionMenu(row, values=[MIC_DEFAULT], command=self._pick_mic, height=34,
-                                          corner_radius=10, font=self._font(13), fg_color=C["surface2"],
-                                          button_color=C["chip_hover"], button_hover_color=C["accent"],
-                                          dropdown_fg_color=C["surface2"], dropdown_hover_color=C["accent"],
-                                          dropdown_font=self._font(13), text_color=C["text"])
-        self.mic_menu.set(self.settings["mic"] or MIC_DEFAULT)
-        self.mic_menu.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(row, text="↻", width=40, height=34, corner_radius=10, font=self._font(16, True),
-                      fg_color=C["surface2"], hover_color=C["chip_hover"],
-                      command=self.refresh_mics).pack(side="left", padx=(8, 0))
-        self.refresh_mics()
-        s = self._section(t_dict, "Настройки")
-        self.sw_paste = self._switch(s, "Вставлять текст туда, где курсор", "paste")
-        self.sw_overlay = self._switch(s, "Показывать окошко с текстом", "overlay")
-        self.settings["autostart"] = autostart_enabled()
-        self.sw_autostart = self._switch(s, "Запускать вместе с Windows", "autostart")
-        self.sw_unmute = self._switch(s, "Включать микрофон, если он выключен", "auto_unmute")
-        s = self._section(t_dict, "Как пользоваться")
-        for line in ("Alt+Z — начать, ещё раз Alt+Z — вставить текст туда, где курсор.",
-                     "Голосом: «новая строка», «новый абзац» · «new line», «new paragraph».",
-                     "Закрытие окна не выключает программу — она ждёт у часов."):
-            self._label(s, "•  " + line, 12, C["muted"], wrap=420).pack(fill="x", pady=1)
+        last = ctk.CTkFrame(pg, fg_color=C["surface"], corner_radius=18)
+        last.pack(fill="x", pady=(0, 12))
+        top = ctk.CTkFrame(last, fg_color="transparent")
+        top.pack(fill="x", padx=20, pady=(16, 0))
+        self._label(top, "Последняя диктовка", 15, bold=True).pack(side="left")
+        self.last_meta = self._label(top, "", 12, C["muted"])
+        self.last_meta.pack(side="left", padx=(10, 0))
+        self.last_copy = ctk.CTkButton(top, text="Копировать", width=10, height=28, corner_radius=8,
+                                       font=self._font(12, True), fg_color=C["surface2"],
+                                       hover_color=C["chip_hover"], text_color=C["text"],
+                                       command=lambda: self.copy(self.history.items[0]["text"])
+                                       if self.history.items else None)
+        self.last_copy.pack(side="right")
+        self.last_text = self._label(last, "", 13, wrap=640)
+        self.last_text.pack(fill="x", padx=20, pady=(8, 18))
 
         # ── Лекции ──
-        s = self._section(t_lec, "Откуда слушать")
+        pg, head = self._page("lecture", "Лекции и подкасты",
+                              "Запишу лекцию, видео или прямой эфир и переведу на русский")
+        self.lec_hero = Hero(pg, self.scale, bg=C["bg"], colors=("#6d28d9", "#db2777"), glyph=ICONS["play"],
+                             accent="#7c3aed", eyebrow="Лекция", title="Слушаю и перевожу", subtitle="",
+                             hotkey="Alt + X", command=self.toggle_translate, level_source=lambda: 0.0,
+                             ui_font=UI_FONT, bars=False)
+        self.lec_hero.pack(fill="x", pady=(0, 14))
+        s = self._section(pg, "Откуда слушать")
         self.src_seg = self._seg(s, [("system", "Весь звук"), ("app", "Программа"), ("link", "Ссылка")],
                                  self.set_source)
         self.src_seg.pack(fill="x")
         self.src_box = ctk.CTkFrame(s, fg_color="transparent")
-        self.src_box.pack(fill="x", pady=(10, 0))
+        self.src_box.pack(fill="x", pady=(12, 0))
         # весь звук
         self.sys_box = ctk.CTkFrame(self.src_box, fg_color="transparent")
         self._label(self.sys_box, "Слушает всё, что играет на ноутбуке. Чтобы параллельно смотреть своё "
-                    "видео — выберите «Программа» или «Ссылка».", 12, C["muted"], wrap=420).pack(fill="x")
+                    "видео — выберите «Программа» или «Ссылка».", 12, C["muted"], wrap=620).pack(fill="x")
         # одна программа
         self.app_box = ctk.CTkFrame(self.src_box, fg_color="transparent")
         row = ctk.CTkFrame(self.app_box, fg_color="transparent")
         row.pack(fill="x")
-        self.app_menu = ctk.CTkOptionMenu(row, values=["нажмите ↻"], command=self._pick_app, height=34,
+        self.app_menu = ctk.CTkOptionMenu(row, values=["нажмите ↻"], command=self._pick_app, height=36,
                                           corner_radius=10, font=self._font(13), fg_color=C["surface2"],
                                           button_color=C["chip_hover"], button_hover_color=C["accent"],
                                           dropdown_fg_color=C["surface2"], dropdown_hover_color=C["accent"],
                                           dropdown_font=self._font(13), text_color=C["text"])
         self.app_menu.set(self.settings["src_app"] or "выберите программу")
         self.app_menu.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(row, text="↻", width=40, height=34, corner_radius=10, font=self._font(16, True),
-                      fg_color=C["surface2"], hover_color=C["chip_hover"],
+        ctk.CTkButton(row, text="", image=self._glyph("refresh", C["text"], 16), width=40, height=36,
+                      corner_radius=10, fg_color=C["surface2"], hover_color=C["chip_hover"],
                       command=self.refresh_programs).pack(side="left", padx=(8, 0))
-        self.sw_duck = self._switch(self.app_box, "Приглушить её для меня (запись не страдает)", "duck")
+        self.sw_duck = self._switch(self.app_box, "Приглушить её для меня", "duck",
+                                    "Вы её почти не слышите, а запись идёт в полной громкости.")
         self._label(self.app_box, "В списке — программы, которые сейчас играют звук. Своё видео смотрите в "
                     "другой программе: например, лекция в Edge, видео в Firefox.", 12, C["muted"],
-                    wrap=420).pack(fill="x")
+                    wrap=620).pack(fill="x", pady=(4, 0))
         # ссылка
         self.link_box = ctk.CTkFrame(self.src_box, fg_color="transparent")
         row = ctk.CTkFrame(self.link_box, fg_color="transparent")
         row.pack(fill="x")
-        self.link_entry = ctk.CTkEntry(row, placeholder_text="Ссылка на YouTube, VK Видео, Twitch…", height=36,
+        self.link_entry = ctk.CTkEntry(row, placeholder_text="Ссылка на YouTube, VK Видео, Twitch…", height=38,
                                        corner_radius=10, font=self._font(13), fg_color=C["surface2"],
                                        border_color=C["border"], text_color=C["text"])
         if self.settings["link"]:
@@ -1725,36 +1703,120 @@ class App:
         # Ctrl+V при русской раскладке tkinter не понимает — ловим по коду клавиши
         self.link_entry._entry.bind("<Control-KeyPress>", lambda e: self.link_entry._entry.event_generate(
             "<<Paste>>") if e.keycode == 86 and e.keysym.lower() != "v" else None)
-        ctk.CTkButton(row, text="Вставить", width=90, height=36, corner_radius=10, font=self._font(13, True),
-                      fg_color=C["surface2"], hover_color=C["chip_hover"],
+        ctk.CTkButton(self.link_box.winfo_children()[0], text="Вставить", width=96, height=38, corner_radius=10,
+                      font=self._font(13, True), fg_color=C["surface2"], hover_color=C["chip_hover"],
                       command=self.paste_link).pack(side="left", padx=(8, 0))
         self._label(self.link_box, "Запись обрабатывается быстрее реального времени, прямой эфир — по ходу "
-                    "трансляции. Звук у вас при этом не играет.", 12, C["muted"], wrap=420).pack(fill="x", pady=(6, 0))
-
-        s = self._section(t_lec, "Язык лекции")
+                    "трансляции. Звук у вас при этом не играет.", 12, C["muted"], wrap=620).pack(fill="x",
+                                                                                               pady=(8, 0))
+        s = self._section(pg, "Язык лекции")
         self.lec_seg = self._seg(s, [("en", "English → перевод"), ("ru", "Русский")], self.set_lec_lang)
         self.lec_seg.pack(fill="x")
-        self.tr_btn = ctk.CTkButton(t_lec, text="", command=self.toggle_translate, height=48, corner_radius=14,
-                                    font=self._font(15, True), fg_color=C["surface2"], hover_color=C["chip_hover"],
-                                    border_width=1, border_color=C["border"])
-        self.tr_btn.pack(fill="x", pady=(0, 10))
-        s = self._section(t_lec, "Перевод")
+        s = self._section(pg, "Перевод")
         self.mode_seg = self._seg(s, [(True, "Онлайн · Google"), (False, "Офлайн")], self.set_tr_mode)
         self.mode_seg.pack(fill="x")
-        self.mode_info = self._label(s, "", 12, C["muted"], wrap=420)
-        self.mode_info.pack(fill="x", pady=(8, 0))
+        self.mode_info = self._label(s, "", 12, C["muted"], wrap=620)
+        self.mode_info.pack(fill="x", pady=(10, 0))
 
         # ── История ──
-        hh = ctk.CTkFrame(t_hist, fg_color="transparent")
-        hh.pack(fill="x", pady=(0, 6))
-        self._label(hh, f"Последние {HISTORY_MAX} диктовок", 14, bold=True).pack(side="left")
-        ctk.CTkButton(hh, text="Очистить", width=80, height=28, corner_radius=8, font=self._font(12),
-                      fg_color="transparent", hover_color=C["surface2"], text_color=C["muted"],
-                      command=lambda: (self.history.clear(), self.render_history())).pack(side="right")
-        self.list = ctk.CTkScrollableFrame(t_hist, fg_color="transparent", scrollbar_button_color=C["surface2"],
-                                           scrollbar_button_hover_color=C["chip_hover"])
+        pg, head = self._page("history", "История", f"Последние {HISTORY_MAX} диктовок — более старые удаляются сами")
+        tools = ctk.CTkFrame(head, fg_color="transparent")
+        tools.pack(side="right", anchor="s")
+        self.hist_search = ctk.CTkEntry(tools, placeholder_text="Поиск", width=200, height=34, corner_radius=10,
+                                        font=self._font(13), fg_color=C["surface"], border_color=C["line"],
+                                        text_color=C["text"])
+        self.hist_search.pack(side="left")
+        self.hist_search.bind("<KeyRelease>", lambda e: self.render_history())
+        ctk.CTkButton(tools, text="Очистить", width=10, height=34, corner_radius=10, font=self._font(13),
+                      fg_color="transparent", hover_color=C["surface"], text_color=C["muted"],
+                      command=self.clear_history).pack(side="left", padx=(8, 0))
+        self.list = ctk.CTkFrame(pg, fg_color="transparent")
         self.list.pack(fill="both", expand=True)
+
+        # ── Настройки ──
+        pg, head = self._page("settings", "Настройки")
+        s = self._section(pg, "Микрофон", "Если есть гарнитура — её микрофон обычно слышит чище встроенного.")
+        row = ctk.CTkFrame(s, fg_color="transparent")
+        row.pack(fill="x")
+        self.mic_menu = ctk.CTkOptionMenu(row, values=[MIC_DEFAULT], command=self._pick_mic, height=36,
+                                          corner_radius=10, font=self._font(13), fg_color=C["surface2"],
+                                          button_color=C["chip_hover"], button_hover_color=C["accent"],
+                                          dropdown_fg_color=C["surface2"], dropdown_hover_color=C["accent"],
+                                          dropdown_font=self._font(13), text_color=C["text"])
+        self.mic_menu.set(self.settings["mic"] or MIC_DEFAULT)
+        self.mic_menu.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="", image=self._glyph("refresh", C["text"], 16), width=40, height=36,
+                      corner_radius=10, fg_color=C["surface2"], hover_color=C["chip_hover"],
+                      command=self.refresh_mics).pack(side="left", padx=(8, 0))
+        self.refresh_mics()
+        self.sw_unmute = self._switch(s, "Включать микрофон, если он выключен", "auto_unmute",
+                                      "Например, если его случайно выключили клавишей на ноутбуке.")
+        s = self._section(pg, "Поведение")
+        self.sw_paste = self._switch(s, "Вставлять текст туда, где курсор", "paste",
+                                     "Выключено — текст только сохраняется в «Истории».")
+        self.sw_overlay = self._switch(s, "Показывать окошко с текстом", "overlay")
+        self.settings["autostart"] = autostart_enabled()
+        self.sw_autostart = self._switch(s, "Запускать вместе с Windows", "autostart",
+                                         "Программа тихо ждёт у часов — Alt+Z работает сразу.")
+        s = self._section(pg, "Качество распознавания")
+        self.sw_keep = self._switch(s, "Хранить 5 последних записей", "keep_recordings",
+                                    "Только на этом компьютере — чтобы при необходимости проверить, как "
+                                    "программа слышит ваш голос.")
+        ctk.CTkButton(s, text="  Открыть папку с записями", image=self._glyph("folder", C["text"], 16),
+                      compound="left", height=34, corner_radius=10, font=self._font(13), fg_color=C["surface2"],
+                      hover_color=C["chip_hover"], text_color=C["text"],
+                      command=self.open_recordings).pack(anchor="w", pady=(8, 0))
+        s = self._section(pg, "Как пользоваться")
+        for line in ("Alt+Z — начать, ещё раз Alt+Z — вставить текст туда, где курсор.",
+                     "Голосом: «новая строка», «новый абзац» · «new line», «new paragraph».",
+                     "Alt+X — записать лекцию или подкаст, ещё раз Alt+X — перевод.",
+                     "Закрытие окна не выключает программу — она ждёт у часов. Выход — через значок там же."):
+            self._label(s, "•  " + line, 13, C["muted"], wrap=620).pack(fill="x", pady=2)
+        s = self._section(pg, "О программе")
+        self._label(s, f"Голосовой помощник {APP_VERSION}", 13).pack(fill="x")
+        self._label(s, "Распознавание: GigaAM v3 (русский) и NVIDIA Parakeet (английский) — работают без "
+                    "интернета. Определение речи: Silero VAD.", 12, C["muted"], wrap=620).pack(fill="x", pady=(4, 0))
+
         self.render_history()
+        self.show_page("home")
+
+    @staticmethod
+    def _greeting() -> str:
+        h = dt.datetime.now().hour
+        return ("Доброй ночи" if h < 5 else "Доброе утро" if h < 12 else "Добрый день" if h < 18
+                else "Добрый вечер")
+
+    def render_home(self):
+        st = self.stats
+        today, total, saved = st.today(), st.words, st.saved_minutes()
+        self.stat_labels["today"][0].configure(text=f"{today:,}".replace(",", " "))
+        self.stat_labels["today"][1].configure(text=dt.date.today().strftime("%d.%m"))
+        self.stat_labels["total"][0].configure(text=f"{total:,}".replace(",", " "))
+        self.stat_labels["total"][1].configure(text=f"{st.sessions} диктовок")
+        self.stat_labels["saved"][0].configure(text=f"{saved / 60:.1f} ч" if saved >= 60 else f"{saved:.0f} мин")
+        self.stat_labels["saved"][1].configure(text="по сравнению с печатью")
+        self.home_title.configure(text=self._greeting())
+        if self.history.items:
+            item = self.history.items[0]
+            text = item["text"]
+            self.last_meta.configure(text=f"{item['time']}  ·  {item['lang'].upper()}")
+            self.last_text.configure(text=text if len(text) < 420 else text[:420].rsplit(" ", 1)[0] + "…",
+                                     text_color=C["text"])
+            self.last_copy.pack(side="right")
+        else:
+            self.last_meta.configure(text="")
+            self.last_text.configure(text="Пока пусто. Нажмите Alt+Z в любом окне и скажите что-нибудь.",
+                                     text_color=C["muted"])
+            self.last_copy.pack_forget()
+
+    def clear_history(self):
+        self.history.clear()
+        self.render_history()
+
+    def open_recordings(self):
+        folder = DATA_DIR / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(folder)
 
     def set_status(self, text: str, color: str):
         self.status.configure(text=text, text_color=color)
@@ -1783,50 +1845,48 @@ class App:
     def render_history(self):
         for w in self.list.winfo_children():
             w.destroy()
-        if not self.history.items:
-            self._label(self.list, "Пока пусто. Нажмите Alt+Z и скажите что-нибудь.", 13, C["muted"]).pack(
-                anchor="w", pady=8)
-            return
-        for i, item in enumerate(self.history.items):
-            card = ctk.CTkFrame(self.list, fg_color=C["surface"], corner_radius=12, border_width=1,
-                                border_color=C["border"])
-            card.pack(fill="x", pady=(0, 8), padx=(0, 4))
+        query = self.hist_search.get().strip().lower() if hasattr(self, "hist_search") else ""
+        items = [(i, it) for i, it in enumerate(self.history.items) if query in it["text"].lower()]
+        if not items:
+            msg = ("Ничего не нашлось." if query else "Пока пусто. Нажмите Alt+Z в любом окне и скажите что-нибудь.")
+            self._label(self.list, msg, 13, C["muted"]).pack(anchor="w", pady=8)
+        for i, item in items:
+            card = ctk.CTkFrame(self.list, fg_color=C["surface"], corner_radius=16)
+            card.pack(fill="x", pady=(0, 10), padx=(0, 4))
             top = ctk.CTkFrame(card, fg_color="transparent")
-            top.pack(fill="x", padx=14, pady=(10, 0))
+            top.pack(fill="x", padx=18, pady=(14, 0))
             ctk.CTkLabel(top, text=f" {item['lang'].upper()} ", font=self._font(11, True), corner_radius=6,
-                         fg_color=C["surface2"], text_color=C["muted"], height=20).pack(side="left")
+                         fg_color=C["surface2"], text_color=C["muted"], height=22).pack(side="left")
             self._label(top, f"   {item['time']}", 12, C["muted"]).pack(side="left")
-            for label, fn in (("Удалить", lambda i=i: (self.history.remove(i), self.render_history())),
-                              ("Копировать", lambda t=item["text"]: self.copy(t))):
-                ctk.CTkButton(top, text=label, width=10, height=24, corner_radius=6, font=self._font(12, True),
-                              fg_color="transparent", hover_color=C["surface2"], text_color=C["accent_text"],
+            for label, fn, color in (("Удалить", lambda i=i: (self.history.remove(i), self.render_history()),
+                                      C["muted"]),
+                                     ("Копировать", lambda t=item["text"]: self.copy(t), C["accent_text"])):
+                ctk.CTkButton(top, text=label, width=10, height=26, corner_radius=8, font=self._font(12, True),
+                              fg_color="transparent", hover_color=C["surface2"], text_color=color,
                               command=fn).pack(side="right", padx=(4, 0))
-            self._label(card, item["text"], 13, wrap=400).pack(fill="x", padx=14, pady=(4, 12))
+            self._label(card, item["text"], 14, wrap=640).pack(fill="x", padx=18, pady=(6, 16))
+        if hasattr(self, "stat_labels"):
+            self.render_home()
 
     def refresh_controls(self):
         s = self.settings
-        if self.recording:
-            self.rec_btn.configure(text="■   Остановить и вставить     Alt+Z", fg_color=C["rec"],
-                                   hover_color=C["rec_hover"])
-        else:
-            self.rec_btn.configure(text="●   Начать диктовку     Alt+Z", fg_color=C["accent"],
-                                   hover_color=C["accent_hover"])
+        self.hero.set_active(self.recording)
+        self.hero.set_text(status="Слушаю… Ещё раз Alt+Z — остановить и вставить текст." if self.recording else "")
         for seg, value in ((self.lang_seg, s["lang"]), (self.mode_seg, s["tr_online"]),
                            (self.src_seg, s["src"]), (self.lec_seg, s["lec_lang"])):
             seg.set(seg.labels[value])
-        for sw in (self.sw_paste, self.sw_overlay, self.sw_duck, self.sw_autostart, self.sw_unmute):
+        for sw in (self.sw_paste, self.sw_overlay, self.sw_duck, self.sw_autostart, self.sw_unmute, self.sw_keep):
             sw.select() if s[sw.key] else sw.deselect()
         for box in (self.sys_box, self.app_box, self.link_box):
             box.pack_forget()
         {"system": self.sys_box, "app": self.app_box, "link": self.link_box}[s["src"]].pack(fill="x")
         action = "перевести" if s["lec_lang"] == "en" else "сохранить"
-        if self.translating:
-            self.tr_btn.configure(text=f"■   Остановить и {action}     Alt+X", fg_color=C["blue_btn"],
-                                  hover_color=C["blue_btn_hover"], border_color=C["blue_btn"])
-        else:
-            start = "Обработать ссылку" if s["src"] == "link" else "Слушать лекцию"
-            self.tr_btn.configure(text=f"▶   {start}     Alt+X", fg_color=C["surface2"],
-                                  hover_color=C["chip_hover"], border_color=C["border"])
+        where = {"system": "весь звук ноутбука", "app": "одну программу", "link": "видео по ссылке"}[s["src"]]
+        self.lec_hero.set_active(self.translating)
+        self.lec_hero.set_text(
+            title="Слушаю и перевожу" if s["lec_lang"] == "en" else "Слушаю и записываю",
+            subtitle=f"Источник — {where}. Нажмите Alt+X, чтобы начать; ещё раз — {action}.",
+            status=f"Идёт запись… Alt+X — остановить и {action}." if self.translating else "")
         self.mode_info.configure(text=self.tr_note or (
             "Живой перевод Google, нужен интернет — английский текст уходит в Google. "
             "Без интернета программа сама переводит офлайн."
@@ -1834,13 +1894,13 @@ class App:
             "Всё на ноутбуке, без интернета. Перевод верный по смыслу, но местами буквальный."))
         self.panel.set_mode("· Google" if s["tr_online"] else "· офлайн")
         if self.loading_msg:
-            self.set_status(self.loading_msg, C["muted"])
+            self.set_status("●  " + self.loading_msg, C["muted"])
         elif self.recording:
-            self.set_status("●  идёт запись", C["rec"])
+            self.set_status("●  Идёт запись", C["rec"])
         elif self.translating:
-            self.set_status("●  слушаю лекцию", C["blue"])
+            self.set_status("●  Слушаю лекцию", C["blue"])
         else:
-            self.set_status("●  готово", C["ok"])
+            self.set_status("●  Готово к работе", C["ok"])
         try:
             self.tray.icon = make_icon(self.recording, 64)
         except Exception:
@@ -1855,14 +1915,6 @@ class App:
             above = self.pill.last_size[1] - self.px(40) if self.pill.visible else 0
             self.panel.relayout(base + max(0, above))
 
-    def _wheel(self, e):
-        try:
-            top = e.widget.winfo_toplevel()
-        except Exception:
-            return
-        step = int(-e.delta / 120)
-        del top, step                                 # окна лекции прокручиваются сами (overlay_ui)
-
     # ---------- события ----------
     def ui(self, *msg):
         self.uiq.put(msg)
@@ -1870,10 +1922,16 @@ class App:
     def _poll(self):
         try:
             while True:
-                self._handle(*self.uiq.get_nowait())
+                msg = self.uiq.get_nowait()
+                try:
+                    self._handle(*msg)
+                except Exception as e:                # ошибка в одном событии не должна «заморозить» окно
+                    log("!! интерфейс:", msg[0], e)
+                    import traceback
+                    traceback.print_exc()
         except queue.Empty:
             pass
-        self.root.after(40, self._poll)
+        self.root.after(30, self._poll)
 
     def _handle(self, kind, *args):
         show_ov = self.settings["overlay"]
@@ -1896,10 +1954,15 @@ class App:
             if show_ov and self.recording:
                 self.pill.show()
                 self.layout_overlays()
+        elif kind == "dict_ready":                  # микрофон открылся — индикатор голоса оживает
+            self.pill.set_ready()
+        elif kind == "dict_lang":                   # «Авто»: язык определён по голосу
+            self.pill.set_lang(args[0])
         elif kind == "dict_done":
             final = args[0]
             if not self.recording:
-                self.pill.set_state("done" if final else "idle")
+                label = "Вставлено" if self.settings["paste"] else "Сохранено в истории"
+                self.pill.set_state("done" if final else "idle", done_label=label)
                 self.pill.set_text(final, "", "Ничего не услышал")
                 self.pill.show_all()                    # итог — сразу целиком
                 if show_ov:

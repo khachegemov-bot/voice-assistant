@@ -79,19 +79,23 @@ a.history = type("DemoHistory", (), {"items": [
                                                    "the next steps."},
     {"time": "30.09 19:12", "lang": "ru", "text": "Купить хлеб, молоко и кофе. Записаться к врачу на понедельник."},
 ], "remove": lambda self, i: None, "clear": lambda self: None, "add": lambda self, *x: None})()
+a.stats = type("DemoStats", (), {"today": lambda self: 1240, "words": 18650, "sessions": 214,
+                                "saved_minutes": lambda self: 18650 / 40 - 18650 / 130})()
 a.render_history()
 a.settings.update({"overlay": True, "src": "link", "link": "https://www.youtube.com/watch?v=aircAruvnKk"})
 a.link_entry.delete(0, "end")
 a.link_entry.insert(0, a.settings["link"])
 main = lambda: u.GetParent(a.root.winfo_id())  # noqa: E731
 steps = [
-    (900, lambda: (a.tabs.set("Диктовка"), a.refresh_controls(), a.root.lift(), a.root.attributes("-topmost", True))),
+    (900, lambda: (a.show_page("home"), a.refresh_controls(), a.root.lift(), a.root.attributes("-topmost", True))),
     (1500, lambda: shot(main(), "1_dictation_tab")),
-    (1700, lambda: a.tabs.set("Лекции")),
+    (1700, lambda: a.show_page("lecture")),
     (2300, lambda: shot(main(), "2_lectures_tab")),
-    (2500, lambda: a.tabs.set("История")),
+    (2500, lambda: a.show_page("history")),
     (3100, lambda: shot(main(), "3_history_tab")),
-    (3300, lambda: a.quit()),
+    (3300, lambda: a.show_page("settings")),
+    (3900, lambda: shot(main(), "4_settings_tab")),
+    (4100, lambda: a.quit()),
 ]
 for n, (ms, fn) in enumerate(steps):
     a.root.after(4000 + n * 1500, fn)          # первые секунды окно дорисовывается; между шагами — пауза
