@@ -90,7 +90,7 @@ from PIL import Image, ImageDraw
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 RATE = 16000
 HISTORY_MAX = 10
 
@@ -468,6 +468,7 @@ class StreamRecognizer:
         self.levels: deque = deque(maxlen=300)
         self.keep_all = False                         # хранить весь звук записи (для итоговой сверки)
         self.all_audio: list = []
+        self.vad_probs: list = []                     # вероятности голоса для всего звука (по 512 отсчётов)
         self.vad = None                               # Silero VAD (поток): отличает голос от шума
         self.voice_since_step = False                 # был ли голос с прошлого шага
         self.voice_samples = 0                        # сколько всего звучал голос
@@ -481,7 +482,10 @@ class StreamRecognizer:
             if self.keep_all:
                 self.all_audio.append(audio)
             if self.vad is not None:
-                voiced = sum(p >= 0.5 for p in self.vad.feed(audio))
+                probs = self.vad.feed(audio)
+                if self.keep_all:
+                    self.vad_probs.extend(probs)
+                voiced = sum(p >= 0.5 for p in probs)
                 if voiced:
                     self.voice_since_step = True
                     self.voice_samples += voiced * 512
@@ -594,10 +598,8 @@ class StreamRecognizer:
                 self.decoded = len(self.buf)
         self.on_live(re.sub(r"[.…]+$", "", " ".join(w for w, _ in self.prev)))
 
-    FINAL_PASS_MAX = 45      # запись не длиннее — после «стоп» распознаётся заново (итоговая сверка, ≤ ~3 с)
-
     def will_final_pass(self) -> bool:
-        return self.keep_all and sum(map(len, self.all_audio)) <= RATE * self.FINAL_PASS_MAX
+        return self.keep_all          # диктовка: итоговая сверка любой длины (идёт в фоне — см. Finalizer)
 
     def finish(self):
         """Конец записи: дораспознаём всё, что осталось, целиком.
@@ -629,6 +631,74 @@ def split_at_pauses(audio: np.ndarray, min_s: float = 12, max_s: float = 20) -> 
         pos = end
     parts.append(audio[pos:])
     return parts
+
+
+class Finalizer:
+    """Итоговая сверка, которая идёт в фоне прямо во время диктовки.
+
+    Потоковое распознавание показывает слова сразу, но режет речь на куски — на стыках рвутся фразы
+    и появляются лишние точки. Поэтому готовые куски записи (12–20 с, разрезанные в паузах) распознаются
+    заново целиком, с укороченными паузами (на длинной тишине модель теряет слова). После «стоп»
+    остаётся дораспознать только хвост — ждать почти не приходится, какой бы длинной ни была диктовка."""
+    SEG_MIN, SEG_MAX = 12, 20
+
+    def __init__(self, asr: "Recognizers", sr: StreamRecognizer):
+        self.asr, self.sr = asr, sr
+        self.pos = 0                                  # столько отсчётов уже сверено
+        self.text = ""
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="finalizer")
+
+    def start(self):
+        self.thread.start()
+
+    def _audio(self) -> np.ndarray:
+        parts = list(self.sr.all_audio)
+        return np.concatenate(parts) if parts else np.zeros(0, np.float32)
+
+    def _piece(self, audio: np.ndarray, start: int) -> str:
+        from audio_input import SileroVAD, squeeze_pauses
+        hop = SileroVAD.HOP
+        probs = self.sr.vad_probs[start // hop:(start + len(audio) + hop - 1) // hop]
+        words = self.asr.recognize_words(self.sr.lang, squeeze_pauses(audio, probs))
+        piece = " ".join(w for w, _ in words).strip()
+        piece = re.sub(r"(\w)—", r"\1 —", re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece))
+        return "" if not piece or is_filler(piece) else piece
+
+    def _add(self, audio: np.ndarray, start: int):
+        piece = self._piece(audio, start)
+        if piece:
+            self.text = append_piece(self.text, piece, self.sr.lang)
+
+    def _loop(self):
+        while not self.done.wait(0.5):
+            if self.sr.detect:                        # язык ещё не определён — ждём
+                continue
+            with self.lock:
+                audio = self._audio()
+                if len(audio) - self.pos < (self.SEG_MAX + 1) * RATE:
+                    continue
+                cut = self.pos + len(split_at_pauses(audio[self.pos:self.pos + (self.SEG_MAX + 1) * RATE],
+                                                      self.SEG_MIN, self.SEG_MAX)[0])
+                cut -= cut % 512                      # по сетке Silero VAD
+                try:
+                    self._add(audio[self.pos:cut], self.pos)
+                except Exception as e:
+                    log("!! фоновая сверка:", e)
+                self.pos = cut
+
+    def finish(self) -> str:
+        """Стоп: дождаться фоновой работы и дораспознать хвост."""
+        self.done.set()
+        with self.lock:
+            audio = self._audio()
+            pos = self.pos
+            for part in split_at_pauses(audio[pos:], self.SEG_MIN, self.SEG_MAX):
+                self._add(part, pos)
+                pos += len(part)
+            self.pos = pos
+            return self.text
 
 
 def run_stream(audio_q: queue.Queue, sr: StreamRecognizer, alive, skip_samples: int = 0):
@@ -791,31 +861,20 @@ def register_hotkeys(callback):
 
 
 def microphones() -> list[str]:
-    """Названия микрофонов (как их видит Windows через MME — он сам подстраивает частоту)."""
+    """Названия микрофонов (как их видит Windows через MME). Список каждый раз свежий — видна
+    только что подключённая гарнитура."""
+    from audio_input import _pa_lock, _reinit
     try:
-        mme = next(i for i, h in enumerate(sd.query_hostapis()) if h["name"] == "MME")
-        names = [d["name"] for d in sd.query_devices()
-                 if d["max_input_channels"] > 0 and d["hostapi"] == mme and "Переназначение" not in d["name"]
-                 and "Microsoft Sound Mapper" not in d["name"]]
+        with _pa_lock:
+            _reinit()
+            mme = next(i for i, h in enumerate(sd.query_hostapis()) if h["name"] == "MME")
+            names = [d["name"] for d in sd.query_devices()
+                     if d["max_input_channels"] > 0 and d["hostapi"] == mme and "Переназначение" not in d["name"]
+                     and "Microsoft Sound Mapper" not in d["name"]]
         return list(dict.fromkeys(names))
     except Exception as e:
         log("!! список микрофонов:", e)
         return []
-
-
-def mic_device(name: str):
-    """Номер устройства по названию; None — микрофон Windows по умолчанию."""
-    if not name:
-        return None
-    try:
-        mme = next(i for i, h in enumerate(sd.query_hostapis()) if h["name"] == "MME")
-        for i, d in enumerate(sd.query_devices()):
-            if d["name"] == name and d["max_input_channels"] > 0 and d["hostapi"] == mme:
-                return i
-    except Exception:
-        pass
-    log(f"микрофон «{name}» не найден — беру микрофон по умолчанию")
-    return None
 
 
 def _mic_endpoint_volume():
@@ -978,7 +1037,7 @@ class Dictation:
         try:
             from audio_input import MicStream
             name = self.app.settings.get("mic", "")
-            with MicStream(name, lambda block: callback(block[:, None]), mme_device=mic_device(name)) as mic:
+            with MicStream(name, lambda block: callback(block[:, None])) as mic:
                 log("микрофон:", mic.mode)
                 while self.active and self.session == session:
                     time.sleep(0.03)
@@ -989,7 +1048,7 @@ class Dictation:
 
     def _process(self, q: queue.Queue, lang: str):
         text, live = "", ""
-        sr = None
+        sr = fin = None
         final = ""
         try:
             def on_commit(piece: str):
@@ -1011,16 +1070,18 @@ class Dictation:
                 sr.detect = self.app.settings.get("lang") == "auto"     # язык — по голосу
                 sr.on_lang = lambda new: self.app.ui("dict_lang", new)
             sr.STEP = 0.5          # диктовке — обновляем чаще (куски не укорачиваем: иначе рвутся предложения)
+            fin = Finalizer(self.app.asr, sr)
+            fin.start()
             run_stream(q, sr, alive=lambda: True)
-            if sr.will_final_pass():
-                final = self._final_pass(sr, text.strip(), live)
-            else:
-                final = text.strip()
+            final = self._final_pass(sr, fin, text.strip(), live)
         except Exception as e:                          # что бы ни случилось — текст не теряем
             log("!! диктовка:", e)
             import traceback
             traceback.print_exc()
             final = (text + (" " + live if live else "")).strip()
+        finally:
+            if fin is not None:
+                fin.done.set()                          # фоновая сверка не должна работать вечно
         lang = sr.lang if sr is not None else lang
         clear_draft()
         if self.app.settings.get("keep_recordings", True) and sr is not None and sr.all_audio:
@@ -1039,44 +1100,39 @@ class Dictation:
             log("!! вставка:", e)
         self.app.ui("dict_done", final)
 
-    def _final_pass(self, sr: "StreamRecognizer", streamed: str, live: str = "") -> str:
-        """Итоговая сверка: после «стоп» вся запись распознаётся заново (длинная — кусками по 12–20 с,
-        разрезанными в паузах). Модель видит фразы целиком — точнее знаки препинания, заглавные буквы
-        и слова на стыках, где потоковое распознавание резало звук. Хвост записи потоковое распознавание
-        в этом случае не дораспознаёт — его распознаёт именно сверка. Если она вдруг дала заметно
-        меньше слов, чем потоковое, — оставляем потоковое."""
+    def _final_pass(self, sr: "StreamRecognizer", fin: Finalizer, streamed: str, live: str = "") -> str:
+        """Итоговая сверка: запись распознаётся заново кусками по 12–20 с, разрезанными в паузах, с укороченными
+        паузами (большая часть — ещё в фоне во время диктовки, см. Finalizer). Модель видит фразы целиком —
+        точнее знаки препинания, заглавные буквы и слова на стыках, где потоковое распознавание резало звук.
+        Если сверка вдруг дала заметно меньше слов, чем потоковое распознавание, — оставляем потоковое."""
+        whole = (streamed + (" " + live if live else "")).strip()
         parts = sr.all_audio
         if not parts:
-            return streamed
+            fin.done.set()
+            return whole
         audio = np.concatenate(parts)
-        if rms(audio) < 1e-4:                         # тишина — распознавать нечего
-            return streamed
-        if self.app.vad is not None and not streamed and self.app.vad.probs(audio).max() < 0.5:
+        if rms(audio) < 1e-4 or (self.app.vad is not None and not whole and max(sr.vad_probs or [0]) < 0.5):
+            fin.done.set()
             log("итоговая сверка: голоса не слышно — пропускаю")
-            return streamed
+            return whole
         self.app.ui("dict_update", streamed, live)     # живой хвост остаётся на экране, пока идёт сверка
         try:
             t = time.time()
-            pieces = split_at_pauses(audio)
-            first = None
             if sr.detect:                             # короткая фраза — язык ещё не определён
-                lang, res = self.app.asr.detect_lang(pieces[0], sr.lang)
+                from audio_input import squeeze_pauses
+                head = audio[:Finalizer.SEG_MAX * RATE]
+                lang, _ = self.app.asr.detect_lang(squeeze_pauses(head, sr.vad_probs), sr.lang)
+                sr.detect = False
                 if lang and lang != sr.lang:
                     log(f"язык по голосу: {LANG_NAMES[lang]}")
                     sr.lang = lang
                     self.app.ui("dict_lang", lang)
-                    streamed = ""                     # потоковый текст был на другом языке
-                first = res[sr.lang][0]
-            text = ""
-            for i, part in enumerate(pieces):
-                words = first if i == 0 and first is not None else self.app.asr.recognize_words(sr.lang, part)
-                piece = " ".join(w for w, _ in words).strip()
-                piece = re.sub(r"(\w)—", r"\1 —", re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece))
-                if piece and not is_filler(piece):
-                    text = append_piece(text, piece, sr.lang)
+                    whole = ""                        # потоковый текст был на другом языке
+            text = fin.finish()
         except Exception as e:
             log("!! итоговая сверка:", e)
-            return streamed
+            return whole
+        streamed = whole
         if not text or len(text.split()) < len(streamed.split()) * 0.85:
             log("итоговая сверка короче потоковой — оставляю потоковую")
             return streamed

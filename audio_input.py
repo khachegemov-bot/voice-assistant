@@ -78,7 +78,56 @@ def speech_mask(probs: np.ndarray, n_samples: int, pad: float = 0.25, threshold:
     return frame
 
 
+def squeeze_pauses(audio: np.ndarray, probs, keep: float = 0.35, pad: float = 0.2) -> np.ndarray:
+    """Длинные паузы → короткие (keep с). На длинной тишине внутри куска модель распознавания иногда
+    «теряет» слова после неё (на живой записи пропадала целая фраза), а без пауз ещё и быстрее.
+    probs — вероятности голоса Silero VAD с начала этого куска (по одной на 512 отсчётов)."""
+    probs = np.asarray(probs, np.float32)
+    if not len(probs) or not len(audio):
+        return audio
+    m = speech_mask(probs, len(audio), pad=pad)
+    if not m.any():
+        return audio
+    keep_n = int(keep * RATE)
+    out, last = [], 0
+    edges = np.flatnonzero(np.diff(np.concatenate([[1], m.astype(np.int8), [1]])))
+    for s0, s1 in zip(edges[::2], edges[1::2]):          # s0…s1 — тишина
+        if s1 - s0 > keep_n:
+            out.append(audio[last:s0 + keep_n // 2])
+            last = s1 - keep_n // 2
+    out.append(audio[last:])
+    return np.concatenate(out)
+
+
 # ─────────────────────────── захват микрофона ───────────────────────────
+
+_pa_lock = threading.Lock()
+
+
+def _reinit():
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:                      # noqa: BLE001
+        print("!! обновление списка устройств:", e, flush=True)
+
+
+def refresh_devices():
+    """Свежий список звуковых устройств (~0,02 с). Без этого после подключения или отключения гарнитуры
+    номера устройств устаревают, и микрофон не открывается с первого раза."""
+    with _pa_lock:
+        _reinit()
+
+
+def find_mme_input(name: str = ""):
+    """Микрофон через MME по названию; None — микрофон Windows по умолчанию."""
+    if not name:
+        return None
+    mme = _hostapi("MME")
+    for i, d in enumerate(sd.query_devices()):
+        if d["name"] == name and d["max_input_channels"] > 0 and d["hostapi"] == mme:
+            return i
+    return None
 
 def _hostapi(name_part: str):
     for i, h in enumerate(sd.query_hostapis()):
@@ -105,37 +154,51 @@ class MicStream:
     """with MicStream(name, on_audio): on_audio(np.float32 моно 16 кГц) вызывается ~каждые 50 мс."""
 
     def __init__(self, name: str, on_audio, mme_device=None):
-        self.name, self.on_audio, self.mme_device = name, on_audio, mme_device
+        self.name, self.on_audio = name, on_audio
         self.stream = None
         self.mode = ""
 
+    def _open_wasapi(self, dev: int):
+        import soxr
+        info = sd.query_devices(dev)
+        sr, ch = int(info["default_samplerate"]), max(1, min(2, info["max_input_channels"]))
+        rs = soxr.ResampleStream(sr, RATE, 1, dtype="float32", quality="HQ")
+
+        def cb(data, *_):
+            mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+            out = rs.resample_chunk(np.ascontiguousarray(mono, np.float32))
+            if len(out):
+                self.on_audio(out)
+
+        self.stream = sd.InputStream(samplerate=sr, channels=ch, dtype="float32", device=dev,
+                                     blocksize=int(sr * 0.05), callback=cb)
+        try:
+            self.stream.start()
+        except Exception:
+            self.stream.close()
+            self.stream = None
+            raise
+        self.mode = f"WASAPI {sr // 1000} кГц × {ch} кан."
+
     def __enter__(self):
-        dev = find_wasapi_input(self.name)
-        if dev is not None:
-            try:
-                import soxr
-                info = sd.query_devices(dev)
-                sr, ch = int(info["default_samplerate"]), max(1, min(2, info["max_input_channels"]))
-                rs = soxr.ResampleStream(sr, RATE, 1, dtype="float32", quality="HQ")
-
-                def cb(data, *_):
-                    mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
-                    out = rs.resample_chunk(np.ascontiguousarray(mono, np.float32))
-                    if len(out):
-                        self.on_audio(out)
-
-                self.stream = sd.InputStream(samplerate=sr, channels=ch, dtype="float32", device=dev,
-                                             blocksize=int(sr * 0.05), callback=cb)
-                self.stream.start()
-                self.mode = f"WASAPI {sr // 1000} кГц × {ch} кан."
-                return self
-            except Exception as e:          # noqa: BLE001 — падаем на MME
-                print("WASAPI не открылся, беру MME:", e, flush=True)
-                self.stream = None
-        self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", device=self.mme_device,
-                                     blocksize=int(RATE * 0.05), callback=lambda d, *_: self.on_audio(d[:, 0].copy()))
-        self.stream.start()
-        self.mode = "MME 16 кГц"
+        with _pa_lock:
+            _reinit()
+            for attempt in range(2):                # не открылся — обновляем список устройств и ещё раз
+                dev = find_wasapi_input(self.name)
+                if dev is None:
+                    break
+                try:
+                    self._open_wasapi(dev)
+                    return self
+                except Exception as e:          # noqa: BLE001
+                    print(f"WASAPI не открылся (попытка {attempt + 1}):", e, flush=True)
+                    if attempt == 0:
+                        _reinit()
+            self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
+                                         device=find_mme_input(self.name), blocksize=int(RATE * 0.05),
+                                         callback=lambda d, *_: self.on_audio(d[:, 0].copy()))
+            self.stream.start()
+            self.mode = "MME 16 кГц"
         return self
 
     def __exit__(self, *exc):
