@@ -270,7 +270,7 @@ class IsolatedProcessCapture:
             kind, val = self._q.get(timeout=20)
         except _queue.Empty:
             self._proc.terminate()
-            raise RuntimeError("процесс записи звука не запустился")
+            raise RuntimeError("процесс записи звука не запустился") from None
         if kind == "error":
             raise RuntimeError(val)
         return self

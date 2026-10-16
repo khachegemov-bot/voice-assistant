@@ -97,6 +97,6 @@ steps = [
     (3900, lambda: shot(main(), "4_settings_tab")),
     (4100, lambda: a.quit()),
 ]
-for n, (ms, fn) in enumerate(steps):
+for n, (_ms, fn) in enumerate(steps):
     a.root.after(4000 + n * 1500, fn)          # первые секунды окно дорисовывается; между шагами — пауза
 a.run()

@@ -1,0 +1,23 @@
+[project]
+name = "voice-assistant"
+version = "1.4.0"
+description = "Голосовой помощник для Windows: диктовка, запись лекций и перевод — распознавание речи офлайн"
+requires-python = ">=3.12"
+license = "MIT"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["_dev", "build", "dist", "models", "data", "venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "E402",   # app.py: настройка журнала и Windows до тяжёлых импортов — так задумано
+    "E701", "E702",   # короткие однострочники для нажатий клавиш и WAV-заголовков
+    "B008",
+]

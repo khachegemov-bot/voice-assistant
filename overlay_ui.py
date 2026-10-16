@@ -400,10 +400,10 @@ class Bubble:
     # — показ —
     def refresh(self):
         img = self.render()
-        l, t, r, b = work_area()
+        left, _top, right, bottom = work_area()
         w, h = img.size
-        x = (l + r - w) // 2
-        y = b - h - self.bottom_offset + int(46 * self.s)        # тень может заходить за край
+        x = (left + right - w) // 2
+        y = bottom - h - self.bottom_offset + int(46 * self.s)        # тень может заходить за край
         self.win.update(img, x, y, self.alpha)
 
     def show(self):
@@ -639,9 +639,9 @@ class DictationBubble(Bubble):
         dt = min(0.1, now_p - self._t_last)
         self._t_last = now_p
         if self._pending and time.time() >= self._pending[2]:
-            c, l, _ = self._pending
+            committed, live, _ = self._pending
             self._pending = None
-            self._apply(c, l)
+            self._apply(committed, live)
         if self.state == "rec":
             self._update_badge()
             raw = max(float(self.level_source() or 0.0), 1e-6)
@@ -708,7 +708,7 @@ class DictationBubble(Bubble):
             y = text_h - (n - li) * self.line_h + self.shift
             if y <= -self.line_h or y >= text_h:
                 continue
-            for x, i, ww in line:
+            for x, i, _width in line:
                 w, style, born, since = shown[i]
                 k = _ease((now - born) / self.FADE)
                 col = self.COLORS[style]
@@ -860,7 +860,8 @@ class LectureBubble(Bubble):
             fnt = self.f_close if action == "close" else self.f_small_b
             w = fnt.getlength(label)
             x -= w
-            d.text((x, y0 - (int(5 * s) if action == "close" else 0)), label, font=fnt, fill=PALETTE["link"] if action != "close" else PALETTE["grey"])
+            color = PALETTE["grey"] if action == "close" else PALETTE["link"]
+            d.text((x, y0 - (int(5 * s) if action == "close" else 0)), label, font=fnt, fill=color)
             self.buttons.append(((int(x - 6 * s), int(y0 - 6 * s), int(x + w + 6 * s), int(y0 + 20 * s)), action))
             x -= int(18 * s)
         # текст

@@ -21,24 +21,10 @@ import threading
 import time
 import wave
 import winsound
-from collections import deque
 from ctypes import wintypes
 from pathlib import Path
 
-FROZEN = getattr(sys, "frozen", False)            # запущено как собранный .exe
-if FROZEN:
-    # всё нужное лежит внутри сборки, а настройки/журнал/история — в папке пользователя
-    APP_DIR = Path(sys.executable).resolve().parent
-    MODELS_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "models"
-    DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Голосовой помощник"
-else:
-    APP_DIR = Path(__file__).resolve().parent
-    MODELS_DIR = APP_DIR / "models"
-    DATA_DIR = APP_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-os.environ["HF_HUB_OFFLINE"] = "1"                 # модели уже скачаны — в интернет за ними не ходим
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+from paths import APP_DIR, DATA_DIR, FROZEN, MODELS_DIR  # noqa: E402
 
 # Без консоли (pythonw) печатать некуда — пишем журнал в файл. Вспомогательный процесс записи
 # звука программы тоже импортирует этот файл — он пишет в отдельный журнал, чтобы не мешать.
@@ -79,45 +65,23 @@ import customtkinter as ctk
 
 import ctranslate2
 import numpy as np
-import onnx_asr
-import onnxruntime as ort
 import pyperclip
 import pystray
 import sentencepiece as spm
 import sounddevice as sd
 from PIL import Image, ImageDraw
 
+from dsp import RATE, rms, spectral_filter, squeeze_pauses
+from recognition import LANG_NAMES, Finalizer, Recognizers, StreamRecognizer, log, run_stream
+from textproc import append_piece, is_filler, split_sentences, tidy
+
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.3.0"
-RATE = 16000
+APP_VERSION = "1.4.0"
 HISTORY_MAX = 10
 
 
-def spectral_filter(audio: np.ndarray, sr: int, low: float = 0, high: float = 0) -> np.ndarray:
-    """Фильтр через спектр (без SciPy — так программа запускается быстрее и весит меньше).
-    low — убрать всё ниже (гул, стук), high — убрать всё выше (звонкость). Края — плавные."""
-    if not len(audio):
-        return audio.astype(np.float32)
-    spec = np.fft.rfft(audio)
-    f = np.fft.rfftfreq(len(audio), 1 / sr)
-    gain = np.ones_like(f)
-    if low:
-        gain *= np.clip((f - low * 0.5) / (low * 0.5), 0, 1)      # от low/2 до low — плавный подъём
-    if high:
-        gain *= np.clip((high * 1.5 - f) / (high * 0.5), 0, 1)    # от high до 1,5·high — плавный спад
-    return np.fft.irfft(spec * gain, len(audio)).astype(np.float32)
-
-
-def highpass(audio: np.ndarray) -> np.ndarray:
-    return spectral_filter(audio, RATE, low=80)                     # убирает гул и стук
-
-ASR_MODELS = {   # язык: (модель, квантизация)
-    "ru": ("gigaam-v3-e2e-rnnt", "int8"),        # int8: в 4 раза меньше, на 20% быстрее, точность та же
-    "en": ("nemo-parakeet-tdt-0.6b-v2", "int8"),
-}
-LANG_NAMES = {"ru": "Русский", "en": "English"}
 MIC_DEFAULT = "По умолчанию (как в Windows)"
 
 C = {   # тёмная тема в духе Apple: чистый чёрный, графитовые карточки, системный синий и зелёный
@@ -130,10 +94,6 @@ C = {   # тёмная тема в духе Apple: чистый чёрный, г
     "side": "#141416", "line": "#232326", "nav_sel": "#2c2c2e", "nav_hover": "#1f1f22", "muted2": "#636366",
 }
 UI_FONT = "Segoe UI Variable Display"            # шрифт Windows 11; если его нет — обычный Segoe UI
-
-
-def log(*a):
-    print(dt.datetime.now().strftime("%H:%M:%S"), *a, flush=True)
 
 
 # ─────────────────────────── хранилище ───────────────────────────
@@ -275,460 +235,6 @@ def play(path: Path):
     winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
 
 
-def rms(audio: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
-
-
-# ─────────────────────────── текст ───────────────────────────
-
-COMMANDS = {   # голосовые команды
-    "ru": [(r",?\s*\bновый абзац\b[,.!]?\s*", "\n\n"), (r",?\s*\b(?:новая строка|с новой строки)\b[,.!]?\s*", "\n")],
-    "en": [(r",?\s*\bnew paragraph\b[,.!]?\s*", "\n\n"), (r",?\s*\bnew line\b[,.!]?\s*", "\n")],
-}
-
-
-def apply_commands(text: str, lang: str) -> str:
-    for rx, repl in COMMANDS[lang]:
-        text = re.sub(rx, repl, text, flags=re.I)
-    return re.sub(r"\n(\s*)(\w)", lambda m: "\n" + m.group(1) + m.group(2).upper(), text)
-
-
-def join_to_previous(text: str, prev: str) -> str:
-    """Кусок продолжает незаконченную фразу — не начинаем его с заглавной буквы."""
-    if not prev or not text or prev.endswith("\n") or prev.rstrip()[-1:] in ".!?…":
-        return text
-    first = text.split(" ", 1)[0].strip(",.!?")
-    if first in ("Я", "I", "I'm", "I've", "I'll", "I'd") or (len(first) > 1 and first.isupper()):
-        return text
-    return text[0].lower() + text[1:]
-
-
-def append_piece(text: str, piece: str, lang: str = "", commands: bool = True) -> str:
-    """Дописать засчитанный кусок к тексту. Если модель поставила точку на паузе, а следующий кусок
-    продолжает фразу со строчной буквы («удали файл. который…») — точка лишняя, меняем её на запятую."""
-    piece = join_to_previous(piece, text)
-    tail = text.rstrip()
-    if tail.endswith(".") and not tail.endswith("..") and piece[:1].islower():
-        text = tail[:-1] + ","
-    if commands and lang:
-        piece = apply_commands(piece, lang)
-    sep = "" if not text or text.endswith("\n") else " "
-    return text + sep + piece
-
-
-def is_filler(text: str) -> bool:
-    """«А-а-а», «Ммм», «Угу», «Uh», «Hmm» без настоящих слов — не печатаем."""
-    words = re.findall(r"\w+", text.lower())
-    fillers = ("угу", "ага", "хм", "эм", "uh", "um", "hmm", "mm", "mhm", "uhm")
-    return bool(words) and all(len(set(w)) == 1 or w in fillers for w in words)
-
-
-def split_sentences(text: str) -> list[str]:
-    return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]
-
-
-# ─────────────────────────── распознавание ───────────────────────────
-
-def tokens_to_words(tokens: list[str], times: list[float]) -> list[tuple[str, float]]:
-    """Склеивает кусочки слов от модели в слова. Пробел в начале кусочка — начало нового слова.
-    Важно: у моделей есть и отдельный кусочек «просто пробел» — после него тоже начинается новое
-    слово (раньше он терялся, и слова слипались: «во времядиктовки», «могувернуть»)."""
-    words: list[list] = []
-    new_word = True
-    for tok, t in zip(tokens, times):
-        if tok.startswith(" ") or tok.startswith("▁"):
-            new_word = True
-            tok = tok.lstrip(" ▁")
-        if not tok:
-            continue                                  # кусочек «только пробел» — следующий начнёт слово
-        if new_word or not words:
-            words.append([tok, float(t)])
-            new_word = False
-        else:
-            words[-1][0] += tok
-    return [(w, t) for w, t in words]
-
-
-class Recognizers:
-    """Модели распознавания, загружаются при первом использовании."""
-
-    THREADS = 3
-
-    def __init__(self, on_status):
-        self.models: dict = {}
-        self.ts_models: dict = {}
-        self.locks = {lang: threading.Lock() for lang in ASR_MODELS}
-        self.on_status = on_status
-
-    def get(self, lang: str):
-        with self.locks[lang]:
-            if lang not in self.models:
-                self.on_status(f"Загружаю модель ({LANG_NAMES[lang]})…")
-                name, quant = ASR_MODELS[lang]
-                t = time.time()
-                local = MODELS_DIR / name                     # в .exe модели лежат внутри сборки
-                # 3 потока: у процессоров ноутбуков (2 быстрых ядра + 8 экономных) это в 2–3 раза быстрее,
-                # чем «все ядра» по умолчанию — экономные ядра тормозят общую работу
-                opts = ort.SessionOptions()
-                opts.intra_op_num_threads = self.THREADS
-                opts.inter_op_num_threads = 1
-                self.models[lang] = onnx_asr.load_model(name, str(local) if local.is_dir() else None,
-                                                        quantization=quant, sess_options=opts)
-                self.ts_models[lang] = self.models[lang].with_timestamps()
-                # первое распознавание после загрузки в несколько раз медленнее (ONNX готовит вычисления) —
-                # делаем его сразу, чтобы первая диктовка не «подвисала»
-                warm = np.random.default_rng(0).normal(0, 0.01, RATE * 2).astype(np.float32)
-                self.ts_models[lang].recognize(warm, sample_rate=RATE)
-                log(f"модель {name} загружена и прогрета за {time.time() - t:.1f} с")
-                self.on_status(None)
-            return self.models[lang]
-
-    vad = None              # Silero VAD (задаёт App): громкость подстраиваем по голосу, а не по щелчкам
-    VOICE_GATE = False      # приглушать отрезки без голоса — на проверке ухудшило точность (срезает края слов)
-
-    def prepare(self, audio: np.ndarray) -> np.ndarray:
-        """Громкость для распознавания. Раньше подстраивалась по самому громкому месту — щелчок клавиши
-        оказывался громче тихого голоса, и голос оставался тихим. Теперь — по голосу (Silero VAD)."""
-        if not len(audio):
-            return audio
-        mask = None
-        if self.vad is not None and len(audio) >= RATE // 4:
-            from audio_input import speech_mask
-            mask = speech_mask(self.vad.probs(audio), len(audio), pad=0.3)
-            if not mask.any():
-                mask = None
-        if mask is not None:
-            voice_rms = rms(audio[mask])
-            gain = min(0.08 / max(voice_rms, 1e-6), 40)          # голос → комфортный уровень
-            if self.VOICE_GATE:
-                ramp = np.convolve(mask.astype(np.float32), np.ones(800) / 800, "same")   # плавно, без щелчков
-                audio = audio * (0.15 + 0.85 * ramp)                # без голоса — тише в ~7 раз
-        else:
-            peak = np.percentile(np.abs(audio), 99.9)
-            gain = min(0.5 / peak, 50) if peak > 0 else 1.0
-        out = audio * gain
-        return (np.tanh(out * 1.2) / 1.2).astype(np.float32)          # мягкий ограничитель вместо обрезания
-
-    def recognize(self, lang: str, audio: np.ndarray) -> tuple[list[tuple[str, float]], float]:
-        """Слова с временем начала каждого (в секундах) и уверенность модели (средний log-prob, ≤ 0)."""
-        self.get(lang)
-        audio = self.prepare(highpass(audio))
-        r = self.ts_models[lang].recognize(audio, sample_rate=RATE)
-        lp = getattr(r, "logprobs", None) or []
-        return tokens_to_words(r.tokens or [], r.timestamps or []), (float(np.mean(lp)) if lp else -9.0)
-
-    def recognize_words(self, lang: str, audio: np.ndarray) -> list[tuple[str, float]]:
-        return self.recognize(lang, audio)[0]
-
-    LANG_MARGIN = 0.05       # насколько одна модель должна быть увереннее другой, чтобы сменить язык
-
-    def detect_lang(self, audio: np.ndarray, guess: str, known: dict | None = None) -> tuple[str | None, dict]:
-        """Язык речи по самому голосу: обе модели распознают один и тот же звук, побеждает более уверенная.
-        Русская модель, слыша английскую речь, пишет латиницей — это тоже верный признак.
-        Возвращает (язык или None — «пока непонятно», результаты обеих моделей)."""
-        res = dict(known or {})
-        for lang in ("ru", "en"):
-            if lang not in res:
-                res[lang] = self.recognize(lang, audio)
-        (ru_words, ru_lp), (en_words, en_lp) = res["ru"], res["en"]
-        if not ru_words and not en_words:
-            return None, res
-        if not en_words:
-            return "ru", res
-        if not ru_words:
-            return "en", res
-        letters = re.findall(r"[^\W\d_]", " ".join(w for w, _ in ru_words))
-        if letters and sum(ch.isascii() for ch in letters) / len(letters) > 0.5:
-            return "en", res
-        if en_lp - ru_lp > self.LANG_MARGIN:
-            return "en", res
-        if ru_lp - en_lp > self.LANG_MARGIN:
-            return "ru", res
-        return None, res
-
-
-class StreamRecognizer:
-    """Потоковое распознавание без потерь слов.
-
-    Каждые ~0,8 с заново распознаём накопленный звук и засчитываем только слова,
-    совпавшие в двух распознаваниях подряд. Законченные фразы отдаём наружу
-    (on_commit), их звук выбрасываем по времени слов — поэтому слова никогда
-    не режутся посередине. Незасчитанный «хвост» показываем вживую (on_live).
-    """
-    STEP = 0.8           # как часто перераспознаём, с
-    LONG_PHRASE = 8      # фраза длиннее — отдаём частями по запятым
-    MAX_BUFFER = 15      # столько звука без конца фразы — отдаём принудительно
-
-    def __init__(self, asr: Recognizers, lang: str, on_commit, on_live, floor: float):
-        self.asr, self.lang = asr, lang
-        self.on_commit, self.on_live, self.floor = on_commit, on_live, floor
-        self.buf = np.zeros(0, np.float32)
-        self.decoded = 0
-        self.prev: list[tuple[str, float]] = []
-        self.levels: deque = deque(maxlen=300)
-        self.keep_all = False                         # хранить весь звук записи (для итоговой сверки)
-        self.all_audio: list = []
-        self.vad_probs: list = []                     # вероятности голоса для всего звука (по 512 отсчётов)
-        self.vad = None                               # Silero VAD (поток): отличает голос от шума
-        self.voice_since_step = False                 # был ли голос с прошлого шага
-        self.voice_samples = 0                        # сколько всего звучал голос
-        self.detect = False                           # «Авто»: язык ещё уточняется по голосу
-        self.on_lang = lambda lang: None
-
-    def feed(self, audio: np.ndarray):
-        if len(audio):
-            self.buf = np.concatenate([self.buf, audio])
-            self.levels.append(rms(audio))
-            if self.keep_all:
-                self.all_audio.append(audio)
-            if self.vad is not None:
-                probs = self.vad.feed(audio)
-                if self.keep_all:
-                    self.vad_probs.extend(probs)
-                voiced = sum(p >= 0.5 for p in probs)
-                if voiced:
-                    self.voice_since_step = True
-                    self.voice_samples += voiced * 512
-
-    def _quiet(self, audio: np.ndarray) -> bool:
-        if self.vad is not None:                      # нейросеть: голос — по звучанию, а не по громкости
-            return not self.voice_since_step
-        noise = float(np.percentile(self.levels, 10)) * 2.5 if len(self.levels) > 20 else 0.0
-        return rms(audio) < max(self.floor, noise)
-
-    def _recognize(self, audio):
-        return self._recognize_lp(audio)[0]
-
-    def _recognize_lp(self, audio):
-        try:
-            return self.asr.recognize(self.lang, audio)
-        except Exception as e:
-            log("!! распознавание:", e)
-            return [], -9.0
-
-    def _check_lang(self, words, lp, quiet: bool) -> tuple[list, bool]:
-        """«Авто»: сверяем язык по голосу, пока он не ясен. Возвращает (слова, можно ли засчитывать)."""
-        heard = self.voice_samples / RATE
-        if not words or (heard < 0.8 and not quiet):
-            return words, False                       # мало голоса — ждём, ничего не засчитываем
-        try:
-            lang, res = self.asr.detect_lang(self.buf, self.lang, {self.lang: (words, lp)})
-        except Exception as e:
-            log("!! определение языка:", e)
-            self.detect = False
-            return words, True
-        final = heard >= 3 or quiet
-        if lang is None and not final:
-            return words, False                       # обе модели одинаково уверены — слушаем дальше
-        self.detect = False
-        if lang and lang != self.lang:
-            log(f"язык по голосу: {LANG_NAMES[lang]} (а не {LANG_NAMES[self.lang]})")
-            self.lang = lang
-            self.prev = []                            # устойчивость слов считаем заново — другая модель
-            self.on_lang(lang)
-            return res[lang][0], False
-        return words, True
-
-    def _emit(self, words):
-        text = " ".join(w for w, _ in words).strip()
-        text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)      # «almost8» → «almost 8»
-        text = re.sub(r"(\w)—", r"\1 —", text)                 # «вторник— встреча» → «вторник — встреча»
-        if text and not is_filler(text):
-            self.on_commit(text)
-
-    @staticmethod
-    def _norm(word: str) -> str:
-        return re.sub(r"[^\w']", "", word.lower())
-
-    def step(self):
-        if len(self.buf) - self.decoded < self.STEP * RATE:
-            return
-        quiet = self._quiet(self.buf[self.decoded:])
-        self.voice_since_step = False
-        if quiet and not self.prev:                   # тишина и дописывать нечего — не тратим процессор
-            self.buf = self.buf[-RATE // 2:]
-            self.decoded = len(self.buf)
-            return
-        words, lp = self._recognize_lp(self.buf)
-        may_commit = True
-        if self.detect:
-            words, may_commit = self._check_lang(words, lp, quiet)
-        self.decoded = len(self.buf)
-        dur = len(self.buf) / RATE
-
-        stable = 0                                    # слова, совпавшие с прошлым распознаванием
-        while stable < min(len(words), len(self.prev)) and \
-                self._norm(words[stable][0]) == self._norm(self.prev[stable][0]):
-            stable += 1
-
-        upto = 0
-        for i in range(stable - 1, -1, -1):           # до конца последней устоявшейся фразы
-            if words[i][0][-1:] in ".?!":
-                upto = i + 1
-                break
-        if not upto and quiet and words and stable == len(words):
-            upto = len(words)                         # пауза в речи — отдаём всё
-        if not upto and dur > self.LONG_PHRASE:       # длинная фраза — по запятой
-            for i in range(stable - 3, 2, -1):
-                if words[i][0].endswith((",", ";", ":")):
-                    upto = i + 1
-                    break
-        if not upto and dur > self.MAX_BUFFER and stable > 3:
-            upto = stable - 2
-        if not may_commit:
-            upto = 0
-
-        if upto:
-            rest = words[upto:]
-            # модель ставит время слова чуть позже его настоящего начала — режем с запасом 0,25 с,
-            # но не раньше последнего засчитанного слова (иначе оно попадёт в текст дважды)
-            if rest:
-                cut = max(words[upto - 1][1] + 0.15, rest[0][1] - 0.25)
-            else:
-                cut = min(dur, words[upto - 1][1] + 0.6)
-            cut = max(0.0, cut)
-            self._emit(words[:upto])
-            self.buf = self.buf[int(cut * RATE):]
-            self.decoded = len(self.buf)
-            self.prev = [(w, t - cut) for w, t in rest]
-        else:
-            self.prev = words
-            if not words and dur > 5:                 # долго ничего не распознаётся — шум/музыка
-                self.buf = self.buf[-RATE:]
-                self.decoded = len(self.buf)
-        self.on_live(re.sub(r"[.…]+$", "", " ".join(w for w, _ in self.prev)))
-
-    def will_final_pass(self) -> bool:
-        return self.keep_all          # диктовка: итоговая сверка любой длины (идёт в фоне — см. Finalizer)
-
-    def finish(self):
-        """Конец записи: дораспознаём всё, что осталось, целиком.
-        Если запись пойдёт на итоговую сверку целиком — хвост отдельно не распознаём (лишняя работа)."""
-        if self.will_final_pass():
-            self.buf = np.zeros(0, np.float32)
-            self.prev = []
-            return
-        if len(self.buf) > RATE * 0.3 and (self.prev or not self._quiet(self.buf)):
-            words = self._recognize(self.buf)
-            if words:
-                self._emit(words)
-        self.buf = np.zeros(0, np.float32)
-        self.prev = []
-        self.on_live("")
-
-
-def split_at_pauses(audio: np.ndarray, min_s: float = 12, max_s: float = 20) -> list[np.ndarray]:
-    """Длинный звук → куски по min_s…max_s секунд, разрезанные в самом тихом месте (между словами)."""
-    parts, pos = [], 0
-    while len(audio) - pos > max_s * RATE:
-        lo, hi = pos + int(min_s * RATE), pos + int(max_s * RATE)
-        win = audio[lo:hi]
-        n = len(win) // 480
-        levels = np.sqrt(np.mean(win[:n * 480].reshape(n, 480) ** 2, axis=1))
-        levels = np.convolve(levels, np.ones(10) / 10, "same")
-        end = lo + int(np.argmin(levels)) * 480 + 240
-        parts.append(audio[pos:end])
-        pos = end
-    parts.append(audio[pos:])
-    return parts
-
-
-class Finalizer:
-    """Итоговая сверка, которая идёт в фоне прямо во время диктовки.
-
-    Потоковое распознавание показывает слова сразу, но режет речь на куски — на стыках рвутся фразы
-    и появляются лишние точки. Поэтому готовые куски записи (12–20 с, разрезанные в паузах) распознаются
-    заново целиком, с укороченными паузами (на длинной тишине модель теряет слова). После «стоп»
-    остаётся дораспознать только хвост — ждать почти не приходится, какой бы длинной ни была диктовка."""
-    SEG_MIN, SEG_MAX = 12, 20
-
-    def __init__(self, asr: "Recognizers", sr: StreamRecognizer):
-        self.asr, self.sr = asr, sr
-        self.pos = 0                                  # столько отсчётов уже сверено
-        self.text = ""
-        self.lock = threading.Lock()
-        self.done = threading.Event()
-        self.thread = threading.Thread(target=self._loop, daemon=True, name="finalizer")
-
-    def start(self):
-        self.thread.start()
-
-    def _audio(self) -> np.ndarray:
-        parts = list(self.sr.all_audio)
-        return np.concatenate(parts) if parts else np.zeros(0, np.float32)
-
-    def _piece(self, audio: np.ndarray, start: int) -> str:
-        from audio_input import SileroVAD, squeeze_pauses
-        hop = SileroVAD.HOP
-        probs = self.sr.vad_probs[start // hop:(start + len(audio) + hop - 1) // hop]
-        words = self.asr.recognize_words(self.sr.lang, squeeze_pauses(audio, probs))
-        piece = " ".join(w for w, _ in words).strip()
-        piece = re.sub(r"(\w)—", r"\1 —", re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece))
-        return "" if not piece or is_filler(piece) else piece
-
-    def _add(self, audio: np.ndarray, start: int):
-        piece = self._piece(audio, start)
-        if piece:
-            self.text = append_piece(self.text, piece, self.sr.lang)
-
-    def _loop(self):
-        while not self.done.wait(0.5):
-            if self.sr.detect:                        # язык ещё не определён — ждём
-                continue
-            with self.lock:
-                audio = self._audio()
-                if len(audio) - self.pos < (self.SEG_MAX + 1) * RATE:
-                    continue
-                cut = self.pos + len(split_at_pauses(audio[self.pos:self.pos + (self.SEG_MAX + 1) * RATE],
-                                                      self.SEG_MIN, self.SEG_MAX)[0])
-                cut -= cut % 512                      # по сетке Silero VAD
-                try:
-                    self._add(audio[self.pos:cut], self.pos)
-                except Exception as e:
-                    log("!! фоновая сверка:", e)
-                self.pos = cut
-
-    def finish(self) -> str:
-        """Стоп: дождаться фоновой работы и дораспознать хвост."""
-        self.done.set()
-        with self.lock:
-            audio = self._audio()
-            pos = self.pos
-            for part in split_at_pauses(audio[pos:], self.SEG_MIN, self.SEG_MAX):
-                self._add(part, pos)
-                pos += len(part)
-            self.pos = pos
-            return self.text
-
-
-def run_stream(audio_q: queue.Queue, sr: StreamRecognizer, alive, skip_samples: int = 0):
-    """Кормит распознаватель звуком из очереди, пока не придёт None или alive() не станет False."""
-    while True:
-        try:
-            item = audio_q.get(timeout=0.5)
-        except queue.Empty:
-            if not alive():
-                break
-            continue
-        pieces, end = [item], item is None
-        while not end:
-            try:
-                nxt = audio_q.get_nowait()
-            except queue.Empty:
-                break
-            pieces.append(nxt)
-            end = nxt is None
-        audio = np.concatenate([p for p in pieces if p is not None] or [np.zeros(0, np.float32)])
-        if skip_samples:
-            cut = min(skip_samples, len(audio))
-            audio, skip_samples = audio[cut:], skip_samples - cut
-        sr.feed(audio)
-        if end or not alive():
-            break
-        sr.step()
-    sr.finish()
-
-
 # ─────────────────────────── перевод ───────────────────────────
 
 class Translator:
@@ -807,8 +313,8 @@ class Translator:
 
 # ─────────────────────────── Windows ───────────────────────────
 
-def paste(text: str):
-    """Вставляет текст в активное окно через буфер обмена и возвращает старый буфер."""
+def paste(text: str, restore: bool = True):
+    """Вставляет текст в активное окно через буфер обмена и (restore) возвращает старый буфер."""
     try:
         old = pyperclip.paste()
     except Exception:
@@ -825,8 +331,36 @@ def paste(text: str):
     # браузеры, Telegram, Discord читают буфер не мгновенно — вернём старый буфер чуть позже,
     # иначе вместо диктовки вставится то, что было в буфере раньше
     time.sleep(0.6)
-    if old:                                         # пустой буфер (или картинка) — не затираем
+    if restore and old:                             # пустой буфер (или картинка) — не затираем
         pyperclip.copy(old)
+
+
+def foreground_elevated() -> bool:
+    """Активное окно запущено от имени администратора, а мы — нет. Тогда Windows не пропустит
+    наши нажатия клавиш (Ctrl+V) в это окно — так устроена защита UIPI."""
+    advapi32 = ctypes.windll.advapi32
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+        proc = kernel32.OpenProcess(0x1000, False, pid.value)          # PROCESS_QUERY_LIMITED_INFORMATION
+        if not proc:
+            return True                                                # даже не открыть — защищённое окно
+        try:
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(proc, 0x0008, ctypes.byref(token)):   # TOKEN_QUERY
+                return True                                            # нет доступа — окно администратора
+            try:
+                elevated, size = wintypes.DWORD(), wintypes.DWORD()
+                ok = advapi32.GetTokenInformation(token, 20, ctypes.byref(elevated), 4, ctypes.byref(size))
+                return bool(ok and elevated.value)                     # 20 = TokenElevation
+            finally:
+                kernel32.CloseHandle(token)
+        finally:
+            kernel32.CloseHandle(proc)
+    except Exception:
+        return False
 
 
 def foreground_is_ours() -> bool:
@@ -1095,7 +629,14 @@ class Dictation:
                 self.app.history.add(final, lang)
                 self.app.stats.add(final)
                 if self.app.settings["paste"] and not foreground_is_ours():
-                    paste(final + " ")
+                    if foreground_elevated():
+                        # в окна администратора Windows может не пропустить Ctrl+V — пробуем, но текст
+                        # оставляем в буфере обмена и подсказываем вставить вручную
+                        paste(final + " ", restore=False)
+                        log("окно от администратора или защищённое — текст оставлен в буфере обмена")
+                        self.app.ui("paste_blocked")
+                    else:
+                        paste(final + " ")
         except Exception as e:
             log("!! вставка:", e)
         self.app.ui("dict_done", final)
@@ -1119,7 +660,6 @@ class Dictation:
         try:
             t = time.time()
             if sr.detect:                             # короткая фраза — язык ещё не определён
-                from audio_input import squeeze_pauses
                 head = audio[:Finalizer.SEG_MAX * RATE]
                 lang, _ = self.app.asr.detect_lang(squeeze_pauses(head, sr.vad_probs), sr.lang)
                 sr.detect = False
@@ -1437,8 +977,7 @@ class LectureListener:
                 except Exception as e:
                     log("!! распознавание:", e)
                     words = []
-                piece = " ".join(w for w, _ in words).strip()
-                piece = re.sub(r"([A-Za-z])(\d)", r"\1 \2", piece)
+                piece = tidy(" ".join(w for w, _ in words).strip())
                 if piece and not is_filler(piece):
                     text = append_piece(text, piece, commands=False)
             pos = end
@@ -1521,8 +1060,7 @@ class App:
         self.refresh_controls()
         register_hotkeys(lambda name, error=False: self.ui(
             "hotkey_error" if error else ("toggle" if name == "dictation" else "toggle_tr"), name))
-        for lang in (("ru", "en") if self.settings["lang"] == "auto" else (self.settings["lang"],)):
-            threading.Thread(target=lambda lang=lang: self.asr.get(lang), daemon=True).start()
+        self.preload_models(self.settings["lang"])
         self.root.after(3000, self._restore_ducked)
         if self.recovered:
             self.root.after(2500, lambda: self.tray.notify(
@@ -2014,10 +1552,18 @@ class App:
             self.pill.set_ready()
         elif kind == "dict_lang":                   # «Авто»: язык определён по голосу
             self.pill.set_lang(args[0])
+        elif kind == "paste_blocked":
+            self.paste_blocked = True
+            self.tray.notify("Окно запущено от имени администратора — Windows может не дать вставить текст. "
+                             "Если он не появился, нажмите Ctrl+V: текст в буфере обмена.", APP_TITLE)
         elif kind == "dict_done":
             final = args[0]
+            blocked, self.paste_blocked = getattr(self, "paste_blocked", False), False
             if not self.recording:
-                label = "Вставлено" if self.settings["paste"] else "Сохранено в истории"
+                if not self.settings["paste"]:
+                    label = "Сохранено в истории"
+                else:
+                    label = "В буфере · Ctrl+V" if blocked else "Вставлено"
                 self.pill.set_state("done" if final else "idle", done_label=label)
                 self.pill.set_text(final, "", "Ничего не услышал")
                 self.pill.show_all()                    # итог — сразу целиком
@@ -2121,7 +1667,9 @@ class App:
             self.mic_warning = False
             lang = self.dictation_lang()
             self.pill.set_state("rec", lang)
-            self.pill.set_text("", "", "Говорите…")
+            loaded = lang in self.asr.models
+            self.pill.set_text("", "", "Говорите…" if loaded else
+                               "Говорите — распознавание ещё загружается, текст появится через пару секунд")
             if self.settings["overlay"]:
                 self.pill.show()
                 self.layout_overlays()
@@ -2277,8 +1825,22 @@ class App:
     def set_lang(self, code: str):
         self.settings.set("lang", code)
         self.refresh_controls()
-        for lang in (("ru", "en") if code == "auto" else (code,)):            # заранее загрузить модели
-            threading.Thread(target=lambda lang=lang: self.asr.get(lang), daemon=True).start()
+        self.preload_models(code)
+
+    def preload_models(self, code: str):
+        """Заранее загрузить модели — по очереди, нужная первой: при включении ноутбука диск и процессор
+        заняты, и одна модель грузится заметно быстрее, чем две наперегонки."""
+        order = {"auto": ("ru", "en"), "ru": ("ru",), "en": ("en",)}.get(code, ("ru",))
+
+        def load():
+            for lang in order:
+                try:
+                    self.asr.get(lang)
+                except Exception as e:
+                    log(f"!! модель {lang} не загрузилась:", e)
+                    self.ui("error", f"Не удалось загрузить распознавание ({LANG_NAMES[lang]}): {e}")
+
+        threading.Thread(target=load, daemon=True, name="preload").start()
 
     def set_tr_mode(self, online: bool):
         self.settings.set("tr_online", online)

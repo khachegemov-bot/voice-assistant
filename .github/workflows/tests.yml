@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # проверяются модули без Windows и тяжёлых моделей: обработка звука, текста и потоковое распознавание
+      - run: pip install numpy==2.5.3 pytest==9.1.1 ruff==0.17.1
+      - run: ruff check .
+      - run: pytest -q

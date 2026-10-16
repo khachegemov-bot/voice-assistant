@@ -14,14 +14,14 @@ import numpy as np
 import onnxruntime as ort
 import sounddevice as sd
 
-RATE = 16000
+from dsp import RATE, VAD_HOP
 
 
 # ─────────────────────────── определение речи ───────────────────────────
 
 class SileroVAD:
     """Потоковая Silero VAD: на каждые 32 мс звука — вероятность, что это голос (0…1)."""
-    HOP, CTX = 512, 64
+    HOP, CTX = VAD_HOP, 64
 
     def __init__(self, model_path: Path):
         opts = ort.SessionOptions()
@@ -64,39 +64,6 @@ class VADStream:
         if not len(self.pending):
             return []
         return self.feed(np.zeros(SileroVAD.HOP - len(self.pending), np.float32))
-
-
-def speech_mask(probs: np.ndarray, n_samples: int, pad: float = 0.25, threshold: float = 0.5) -> np.ndarray:
-    """Маска «здесь речь» по отсчётам, с запасом pad секунд до и после (чтобы не резать начала слов)."""
-    frame = np.repeat(probs >= threshold, SileroVAD.HOP)[:n_samples]
-    frame = np.pad(frame, (0, max(0, n_samples - len(frame))))
-    if frame.any() and pad:
-        k = int(pad * RATE)
-        idx = np.flatnonzero(np.diff(np.concatenate([[0], frame.astype(np.int8), [0]])))
-        for start, end in zip(idx[::2], idx[1::2]):
-            frame[max(0, start - k):min(n_samples, end + k)] = True
-    return frame
-
-
-def squeeze_pauses(audio: np.ndarray, probs, keep: float = 0.35, pad: float = 0.2) -> np.ndarray:
-    """Длинные паузы → короткие (keep с). На длинной тишине внутри куска модель распознавания иногда
-    «теряет» слова после неё (на живой записи пропадала целая фраза), а без пауз ещё и быстрее.
-    probs — вероятности голоса Silero VAD с начала этого куска (по одной на 512 отсчётов)."""
-    probs = np.asarray(probs, np.float32)
-    if not len(probs) or not len(audio):
-        return audio
-    m = speech_mask(probs, len(audio), pad=pad)
-    if not m.any():
-        return audio
-    keep_n = int(keep * RATE)
-    out, last = [], 0
-    edges = np.flatnonzero(np.diff(np.concatenate([[1], m.astype(np.int8), [1]])))
-    for s0, s1 in zip(edges[::2], edges[1::2]):          # s0…s1 — тишина
-        if s1 - s0 > keep_n:
-            out.append(audio[last:s0 + keep_n // 2])
-            last = s1 - keep_n // 2
-    out.append(audio[last:])
-    return np.concatenate(out)
 
 
 # ─────────────────────────── захват микрофона ───────────────────────────
