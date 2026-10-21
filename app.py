@@ -78,7 +78,7 @@ from textproc import append_piece, apply_replacements, is_filler, parse_replacem
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 HISTORY_MAX = 10
 
 
@@ -272,10 +272,23 @@ class Translator:
             res = json.loads(r.read().decode("utf-8"))
         return "".join(part[0] for part in res[0] if part[0]).strip()
 
+    def _online_retry(self, text: str) -> str:
+        """Google иногда отвечает «слишком много запросов» (429) или временной ошибкой сервера — обычно это
+        на секунду-две; пробуем ещё раз, прежде чем переходить на офлайн-перевод (он заметно буквальнее)."""
+        import urllib.error
+        try:
+            return self._online(text)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and e.code < 500:
+                raise
+            log(f"онлайн-перевод: ответ {e.code}, повторяю через 2 с")
+            time.sleep(2)
+            return self._online(text)
+
     def translate(self, sentences: list[str], online: bool) -> str:
         if online and time.time() - self.online_failed_at > self.RETRY_ONLINE_AFTER:
             try:
-                out = self._online(" ".join(sentences))
+                out = self._online_retry(" ".join(sentences))
                 if self.online_failed_at:
                     self.online_failed_at = 0.0
                     self.on_status("online")
@@ -555,10 +568,14 @@ class Dictation:
         self.listen_from = time.time() + self.CHIME
         q: queue.Queue = queue.Queue()
         threading.Thread(target=self._capture, args=(q, self.session), daemon=True).start()
-        threading.Thread(target=self._process, args=(q, lang), daemon=True).start()
+        threading.Thread(target=self._process, args=(q, lang, self.session), daemon=True).start()
 
     def stop(self):
         self.active = False
+
+    def _say(self, session: int, kind: str, *args):
+        """Сообщение окну с номером диктовки: если вы уже начали новую, окно не спутает её с прошлой."""
+        self.app.ui(kind, *args, session)
 
     def _capture(self, q: queue.Queue, session: int):
         # (выключен ли микрофон, проверяется в главном потоке при нажатии Alt+Z — здесь только звук)
@@ -569,7 +586,7 @@ class Dictation:
                 return                                # ещё звучит сигнал «начали»
             block = data[:, 0].copy()
             if not heard["samples"]:
-                self.app.ui("dict_ready")             # микрофон слушает — можно говорить
+                self._say(session, "dict_ready")      # микрофон слушает — можно говорить
             self.level = rms(block)
             q.put(block)
             heard["samples"] += len(block)
@@ -578,8 +595,8 @@ class Dictation:
             if not heard["warned"] and heard["samples"] >= RATE * 2 and heard["peak"] < 1e-6:
                 heard["warned"] = True
                 log("!! микрофон молчит (идеальная тишина)")
-                self.app.ui("mic_problem", "Микрофон ничего не слышит. Проверьте, что он включён "
-                                           "(клавиша с микрофоном на ноутбуке) и не занят другой программой.")
+                self._say(session, "mic_problem", "Микрофон ничего не слышит. Проверьте, что он включён "
+                                                  "(клавиша с микрофоном на ноутбуке) и не занят другой программой.")
 
         try:
             from audio_input import MicStream
@@ -590,10 +607,11 @@ class Dictation:
                     time.sleep(0.03)
         except Exception as e:
             log("!! микрофон:", e)
-            self.app.ui("error", f"Не удалось открыть микрофон: {e}")
+            self._say(session, "mic_failed", str(e))
         q.put(None)
 
-    def _process(self, q: queue.Queue, lang: str):
+    def _process(self, q: queue.Queue, lang: str, session: int | None = None):
+        session = self.session if session is None else session
         text, live = "", ""
         sr = fin = None
         final = ""
@@ -608,19 +626,19 @@ class Dictation:
             def on_live(tail: str):
                 nonlocal live
                 live = tail
-                self.app.ui("dict_update", text, tail)
+                self._say(session, "dict_update", text, tail)
 
             sr = StreamRecognizer(self.app.asr, lang, on_commit, on_live, floor=1e-4)
             sr.keep_all = True
             if self.app.vad is not None:
                 sr.vad = self.app.vad.new_stream()
                 sr.detect = self.app.settings.get("lang") == "auto"     # язык — по голосу
-                sr.on_lang = lambda new: self.app.ui("dict_lang", new)
+                sr.on_lang = lambda new: self._say(session, "dict_lang", new)
             sr.STEP = 0.5          # диктовке — обновляем чаще (куски не укорачиваем: иначе рвутся предложения)
             fin = Finalizer(self.app.asr, sr)
             fin.start()
             run_stream(q, sr, alive=lambda: True)
-            final = self._final_pass(sr, fin, text.strip(), live)
+            final = self._final_pass(sr, fin, text.strip(), live, session)
         except Exception as e:                          # что бы ни случилось — текст не теряем
             log("!! диктовка:", e)
             import traceback
@@ -651,14 +669,15 @@ class Dictation:
                         # оставляем в буфере обмена и подсказываем вставить вручную
                         paste(final + " ", restore=False)
                         log("окно от администратора или защищённое — текст оставлен в буфере обмена")
-                        self.app.ui("paste_blocked")
+                        self._say(session, "paste_blocked")
                     else:
                         paste(final + " ")
         except Exception as e:
             log("!! вставка:", e)
-        self.app.ui("dict_done", final)
+        self._say(session, "dict_done", final)
 
-    def _final_pass(self, sr: "StreamRecognizer", fin: Finalizer, streamed: str, live: str = "") -> str:
+    def _final_pass(self, sr: "StreamRecognizer", fin: Finalizer, streamed: str, live: str = "",
+                    session: int = 0) -> str:
         """Итоговая сверка: запись распознаётся заново кусками по 12–20 с, разрезанными в паузах, с укороченными
         паузами (большая часть — ещё в фоне во время диктовки, см. Finalizer). Модель видит фразы целиком —
         точнее знаки препинания, заглавные буквы и слова на стыках, где потоковое распознавание резало звук.
@@ -673,7 +692,7 @@ class Dictation:
             fin.done.set()
             log("итоговая сверка: голоса не слышно — пропускаю")
             return whole
-        self.app.ui("dict_update", streamed, live)     # живой хвост остаётся на экране, пока идёт сверка
+        self._say(session, "dict_update", streamed, live)   # живой хвост остаётся на экране, пока идёт сверка
         try:
             t = time.time()
             if sr.detect:                             # короткая фраза — язык ещё не определён
@@ -683,9 +702,11 @@ class Dictation:
                 if lang and lang != sr.lang:
                     log(f"язык по голосу: {LANG_NAMES[lang]}")
                     sr.lang = lang
-                    self.app.ui("dict_lang", lang)
+                    self._say(session, "dict_lang", lang)
                     whole = ""                        # потоковый текст был на другом языке
             text = fin.finish()
+            if text is None:                            # процессор занят — не заставляем ждать
+                return whole
         except Exception as e:
             log("!! итоговая сверка:", e)
             return whole
@@ -1591,9 +1612,11 @@ class App:
         self.uiq.put(msg)
 
     def _poll(self):
+        handled = False
         try:
             while True:
                 msg = self.uiq.get_nowait()
+                handled = True
                 try:
                     self._handle(*msg)
                 except Exception as e:                # ошибка в одном событии не должна «заморозить» окно
@@ -1602,9 +1625,20 @@ class App:
                     traceback.print_exc()
         except queue.Empty:
             pass
-        self.root.after(30, self._poll)
+        # в простое — реже, во время записи и анимаций — часто
+        active = handled or self.recording or self.translating or self.pill.visible or self.panel.visible
+        self.root.after(30 if active else 80, self._poll)
+
+    DICT_EVENTS = {"dict_update", "dict_ready", "dict_lang", "dict_done", "mic_problem", "mic_failed",
+                   "paste_blocked"}
 
     def _handle(self, kind, *args):
+        if kind in self.DICT_EVENTS:
+            *args, session = args
+            if session != self.dictation.session:     # от прошлой диктовки — вы уже начали новую
+                if kind == "dict_done":
+                    self.render_history()
+                return
         show_ov = self.settings["overlay"]
         if kind == "toggle":
             self.toggle_record()
@@ -1635,9 +1669,26 @@ class App:
             self.paste_blocked = True
             self.tray.notify("Окно запущено от имени администратора — Windows может не дать вставить текст. "
                              "Если он не появился, нажмите Ctrl+V: текст в буфере обмена.", APP_TITLE)
+        elif kind == "mic_failed":                  # микрофон не открылся — говорим прямо и выходим из записи
+            self.mic_warning = True
+            if self.recording:
+                self.recording = False
+                self.dictation.stop()
+                self.refresh_controls()
+            self.pill.set_problem("Не удалось открыть микрофон. Проверьте, что он подключён и не занят другой "
+                                  "программой, и нажмите Alt+Z ещё раз.")
+            if show_ov:
+                self.pill.show()
+                self.layout_overlays()
+            self.pill.hide_later(6000)
+            self.set_status("Микрофон не открылся", C["rec"])
         elif kind == "dict_done":
             final = args[0]
             blocked, self.paste_blocked = getattr(self, "paste_blocked", False), False
+            if not final and self.mic_warning and self.pill.problem and not self.recording:
+                self.pill.hide_later(6000)            # на экране предупреждение о микрофоне — не затираем
+                self.render_history()
+                return
             if not self.recording:
                 if not self.settings["paste"]:
                     label = "Сохранено в истории"
@@ -1756,7 +1807,7 @@ class App:
             play(SOUND_ON)
             if muted:
                 self.ui("mic_problem", "Микрофон выключен в Windows — включите его клавишей с перечёркнутым "
-                                       "микрофоном или в Параметры → Система → Звук → Ввод.", "muted")
+                                       "микрофоном или в Параметры → Система → Звук → Ввод.", self.dictation.session)
         self.refresh_controls()
 
     def toggle_translate(self):

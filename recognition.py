@@ -339,8 +339,9 @@ class Finalizer:
                 audio = self._audio()
                 if len(audio) - self.pos < (self.SEG_MAX + 1) * RATE:
                     continue
-                cut = self.pos + len(split_at_pauses(audio[self.pos:self.pos + (self.SEG_MAX + 1) * RATE],
-                                                      self.SEG_MIN, self.SEG_MAX)[0])
+                window = audio[self.pos:self.pos + (self.SEG_MAX + 1) * RATE]
+                cut = self.pos + len(split_at_pauses(window, self.SEG_MIN, self.SEG_MAX,
+                                                     self.sr.vad_probs[self.pos // VAD_HOP:])[0])
                 cut -= cut % 512                      # по сетке Silero VAD
                 try:
                     self._add(audio[self.pos:cut], self.pos)
@@ -348,13 +349,19 @@ class Finalizer:
                     log("!! фоновая сверка:", e)
                 self.pos = cut
 
-    def finish(self) -> str:
-        """Стоп: дождаться фоновой работы и дораспознать хвост."""
+    MAX_TAIL = 45            # с — если сверка отстала сильнее (процессор занят другой программой), не ждём
+
+    def finish(self) -> str | None:
+        """Стоп: дождаться фоновой работы и дораспознать хвост. None — сверка слишком отстала:
+        лучше сразу вставить живой текст, чем заставлять ждать."""
         self.done.set()
         with self.lock:
             audio = self._audio()
             pos = self.pos
-            for part in split_at_pauses(audio[pos:], self.SEG_MIN, self.SEG_MAX):
+            if len(audio) - pos > self.MAX_TAIL * RATE:
+                log(f"сверка отстала на {(len(audio) - pos) / RATE:.0f} с — вставляю живой текст")
+                return None
+            for part in split_at_pauses(audio[pos:], self.SEG_MIN, self.SEG_MAX, self.sr.vad_probs[pos // VAD_HOP:]):
                 self._add(part, pos)
                 pos += len(part)
             self.pos = pos

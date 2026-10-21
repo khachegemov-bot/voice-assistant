@@ -63,3 +63,11 @@ def test_split_cuts_in_pauses_and_keeps_everything():
 def test_short_audio_is_not_split():
     audio = tone(300, 5)
     assert len(split_at_pauses(audio)) == 1
+
+
+def test_split_cuts_in_the_middle_of_the_longest_pause():
+    """С разметкой голоса режем посередине самой длинной паузы, даже если громче всего шумит именно там."""
+    audio, probs = frames_for([(13, True), (0.3, False), (2, True), (1.0, False), (6, True)])
+    audio = audio + np.random.default_rng(0).normal(0, 0.05, len(audio)).astype(np.float32)   # громкий шум
+    cut = len(split_at_pauses(audio, 12, 20, probs)[0]) / RATE
+    assert abs(cut - (13 + 0.3 + 2 + 0.5)) < 0.1

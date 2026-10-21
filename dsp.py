@@ -62,16 +62,41 @@ def squeeze_pauses(audio: np.ndarray, probs, keep: float = 0.35, pad: float = 0.
     return np.concatenate(out)
 
 
-def split_at_pauses(audio: np.ndarray, min_s: float = 12, max_s: float = 20) -> list[np.ndarray]:
-    """Длинный звук → куски по min_s…max_s секунд, разрезанные в самом тихом месте (между словами)."""
+def _longest_pause(probs: np.ndarray) -> int | None:
+    """Кадр Silero VAD, где резать: середина самой длинной паузы, а если человек говорил без остановок —
+    самый «неголосовой» кадр (короткий промежуток между словами). None — если вероятностей нет."""
+    if len(probs) < 5:
+        return None
+    smooth = np.convolve(probs, np.ones(5) / 5, "same")
+    quiet = np.concatenate([[False], smooth < 0.35, [False]])
+    edges = np.flatnonzero(np.diff(quiet.astype(np.int8)))
+    if len(edges):
+        starts, ends = edges[::2], edges[1::2]
+        i = int(np.argmax(ends - starts))
+        return int((starts[i] + ends[i]) // 2)
+    return int(np.argmin(np.convolve(probs, np.ones(3) / 3, "same")[1:-1])) + 1
+
+
+def split_at_pauses(audio: np.ndarray, min_s: float = 12, max_s: float = 20, probs=None) -> list[np.ndarray]:
+    """Длинный звук → куски по min_s…max_s секунд, разрезанные между словами.
+
+    С вероятностями голоса (probs — Silero VAD с начала audio, по одной на VAD_HOP отсчётов) режем посередине
+    самой длинной паузы: гул вентилятора или шум улицы так не обманут. Без них — в самом тихом месте."""
+    probs = None if probs is None else np.asarray(probs, np.float32)
     parts, pos = [], 0
     while len(audio) - pos > max_s * RATE:
         lo, hi = pos + int(min_s * RATE), pos + int(max_s * RATE)
-        win = audio[lo:hi]
-        n = len(win) // 480
-        levels = np.sqrt(np.mean(win[:n * 480].reshape(n, 480) ** 2, axis=1))
-        levels = np.convolve(levels, np.ones(10) / 10, "same")
-        end = lo + int(np.argmin(levels)) * 480 + 240
+        end = None
+        if probs is not None and hi // VAD_HOP <= len(probs):
+            frame = _longest_pause(probs[lo // VAD_HOP:hi // VAD_HOP])
+            if frame is not None:
+                end = (lo // VAD_HOP + frame) * VAD_HOP
+        if end is None:
+            win = audio[lo:hi]
+            n = len(win) // 480
+            levels = np.sqrt(np.mean(win[:n * 480].reshape(n, 480) ** 2, axis=1))
+            levels = np.convolve(levels, np.ones(10) / 10, "same")
+            end = lo + int(np.argmin(levels)) * 480 + 240
         parts.append(audio[pos:end])
         pos = end
     parts.append(audio[pos:])
