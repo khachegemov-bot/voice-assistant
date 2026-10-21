@@ -20,7 +20,8 @@ def join_to_previous(text: str, prev: str) -> str:
     if not prev or not text or prev.endswith("\n") or prev.rstrip()[-1:] in ".!?…":
         return text
     first = text.split(" ", 1)[0].strip(",.!?")
-    if first in ("Я", "I", "I'm", "I've", "I'll", "I'd") or (len(first) > 1 and first.isupper()):
+    # английское «I» пишется с заглавной всегда, а русское «я» посреди фразы — со строчной
+    if first in ("I", "I'm", "I've", "I'll", "I'd") or (len(first) > 1 and first.isupper()):
         return text
     return text[0].lower() + text[1:]
 
@@ -52,9 +53,66 @@ def split_sentences(text: str) -> list[str]:
 
 
 def tidy(text: str) -> str:
-    """Мелкие правки распознанного куска: «almost8» → «almost 8», «вторник— встреча» → «вторник — встреча»."""
+    """Мелкие правки распознанного куска: «almost8» → «almost 8», «вторник— встреча» → «вторник — встреча»,
+    без запинок («э-э-э», «эм», «uh») и оборванных начал слов («отве- отвечать»)."""
     text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
-    return re.sub(r"(\w)—", r"\1 —", text)
+    return drop_disfluencies(re.sub(r"(\w)—", r"\1 —", text))
+
+
+# запинки: «э», «э-э-э», «эм», «ммм», «м-м», «хм», «а-а-а» (просто «а» — настоящее слово), «uh», «um», «erm»
+_FILLER = re.compile(r"^(?:э+(?:-э+)*|эм+|м{2,}|м+(?:-м+)+|хм+|а+(?:-а+)+|u+h+|u+m+|uhm|erm?|hmm+|m{2,})$", re.I)
+_EDGE = ",.…!?;:«»\"()"
+
+
+def drop_disfluencies(text: str) -> str:
+    """Убрать запинки и оговорки, сохранив знаки препинания: «помогать мне отве- э-э-э отвечать» →
+    «помогать мне отвечать», «Э-э, я думаю» → «Я думаю», «и всё, эм.» → «и всё.»."""
+    words = [w for w in text.split(" ") if w]
+    kept: list[str] = []
+    cap_next = False
+    for w in words:
+        core = w.strip(_EDGE)
+        if core and _FILLER.match(core):
+            end = w[len(w.rstrip(".!?…")):]            # запинка закончила фразу — точку отдаём предыдущему
+            if end and kept and not kept[-1].endswith((".", "!", "?", "…")):
+                kept[-1] = kept[-1].rstrip(",;:") + end
+            if (not kept or kept[-1].endswith((".", "!", "?", "…"))) and core[:1].isupper():
+                cap_next = True                       # запинка стояла в начале фразы
+            continue
+        if cap_next and w[:1].islower():
+            w = w[0].upper() + w[1:]
+        cap_next = False
+        kept.append(w)
+    out: list[str] = []                               # оборванное слово: «отве-», а следом «отвечать»
+    for i, w in enumerate(kept):
+        if len(w) > 2 and w.endswith("-") and i + 1 < len(kept) and \
+                kept[i + 1].strip(_EDGE).lower().startswith(w[:-1].strip(_EDGE).lower()):
+            continue
+        out.append(w)
+    return " ".join(out)
+
+
+def parse_replacements(text: str) -> list[tuple[str, str]]:
+    """Словарь замен из настроек: по строке «как слышится = как писать» (можно «→» или «->»).
+    Звёздочка в конце — любое окончание: «клоуд* = Claude» заменит «клоуд», «клоуда», «клоуду»."""
+    rules = []
+    for line in text.splitlines():
+        parts = re.split(r"\s*(?:=|→|->)\s*", line.strip(), maxsplit=1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            rules.append((parts[0], parts[1]))
+    return rules
+
+
+def apply_replacements(text: str, rules: list[tuple[str, str]]) -> str:
+    """Заменить слова по словарю: целиком, без учёта регистра; несколько слов — через любые пробелы."""
+    for src, dst in rules:
+        star = src.endswith("*")
+        words = src.rstrip("*").split()
+        if not words:
+            continue
+        rx = r"(?<!\w)" + r"\s+".join(map(re.escape, words)) + (r"\w*" if star else "") + r"(?!\w)"
+        text = re.sub(rx, lambda m, dst=dst: dst, text, flags=re.I)
+    return text
 
 
 def tokens_to_words(tokens: list[str], times: list[float]) -> list[tuple[str, float]]:

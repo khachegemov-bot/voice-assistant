@@ -303,13 +303,13 @@ class Bubble:
         """Нарисовать содержимое внутри блока; вернуть его высоту."""
         raise NotImplementedError
 
-    def _body(self, img: Image.Image, box: tuple[int, int, int, int]):
+    def _body(self, img: Image.Image, box: tuple[int, int, int, int], radius: int | None = None):
         """Сам блок: еле заметный градиент сверху вниз, тонкая светлая кромка — как стекло."""
         s = self.s
         x0, y0, x1, y1 = box
         w, h = x1 - x0, y1 - y0
-        radius = int(26 * s)
-        key = (w, h)
+        radius = min(radius or int(26 * s), h // 2)
+        key = (w, h, radius)
         body = self._body_cache.get(key)
         if body is None:
             t = np.linspace(0, 1, h)[:, None, None]
@@ -759,6 +759,144 @@ class DictationBubble(Bubble):
         self.bottom_offset = bottom_offset
         if self.visible:
             self.refresh()
+
+
+class CompactBubble(DictationBubble):
+    """Компактное окошко диктовки — капсула в одну строку внизу экрана.
+
+    Слева пляшет индикатор голоса, посередине — ваши слова: новые мягко проявляются, строка плавно
+    уезжает влево, а старые слова растворяются у левого края. Справа — язык и время записи.
+    Анимации те же, что у большого окошка (DictationBubble), меняется только раскладка."""
+    WIDTH = 460
+    HEIGHT = 46
+    PAD_X = 18
+    META = {"live": (142, 142, 150), "busy": (196, 181, 253), "done": (110, 231, 183), "warn": (252, 165, 165)}
+
+    def __init__(self, root, scale):
+        super().__init__(root, scale)
+        s = scale
+        self.f_main = _font("seguisb.ttf", int(14.5 * s))
+        self.space = self.f_main.getlength(" ")
+        self.line_h = int(self.f_main.size * 1.45)
+        self.f_meta = _font("seguisb.ttf", int(11.5 * s))
+        self.shadow = Shadow(11 * s, alpha=140)
+        self.xoff = 0.0                       # насколько строка уехала влево (плавно догоняет target)
+        self.target_xoff = 0.0
+        self._t_x = time.perf_counter()
+
+    def set_state(self, state: str, lang: str = "", done_label: str = ""):
+        if state == "rec" and self.state != "rec":
+            self.xoff = self.target_xoff = 0.0
+        super().set_state(state, lang, done_label)
+
+    def animate(self) -> bool:
+        busy = super().animate()
+        now = time.perf_counter()
+        dt, self._t_x = min(0.1, now - self._t_x), now
+        self.xoff += (self.target_xoff - self.xoff) * min(1.0, dt * 9)
+        if abs(self.xoff - self.target_xoff) < 0.5:
+            self.xoff = self.target_xoff
+        return busy or self.xoff != self.target_xoff
+
+    def _meta(self) -> tuple[str, tuple]:
+        if self.state == "rec":
+            sec = int(time.time() - self.started)
+            return f"{self.lang} · {sec // 60}:{sec % 60:02d}", self.META["live"]
+        if self.state == "busy":
+            return "Уточняю…", self.META["busy"]
+        if self.state == "done":
+            return self.done_label, self.META["done"]
+        return "", self.META["live"]
+
+    def render(self) -> Image.Image:
+        if self.problem:
+            return self._render_problem()
+        s = self.s
+        W, H = int(self.WIDTH * s), int(self.HEIGHT * s)
+        margin = int(36 * s)
+        pad = int(self.PAD_X * s)
+        canvas = (W + 2 * margin, H + 2 * margin)
+        bx0, by0 = margin, margin
+        bx1, by1 = bx0 + W, by0 + H
+        img = self.shadow.make(canvas, (bx0, by0 + int(5 * s), bx1, by1 + int(5 * s)))
+        self._body(img, (bx0, by0, bx1, by1), radius=H // 2)
+        d = ImageDraw.Draw(img)
+        cy = by0 + H / 2
+        # слева — индикатор: голос / «уточняю» / галочка «готово»
+        ind_w = self._bars_w()
+        if self.state in ("rec", "busy"):
+            self._draw_bars(d, bx0 + pad, cy)
+        elif self.state == "done":
+            r = 9 * s
+            cx = bx0 + pad + ind_w / 2
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(16, 185, 129, 255))
+            d.line((cx - r * 0.45, cy + r * 0.02, cx - r * 0.1, cy + r * 0.38, cx + r * 0.5, cy - r * 0.35),
+                   fill=(255, 255, 255, 255), width=max(2, int(2.2 * s)), joint="curve")
+        # справа — язык и время, «Уточняю…» или «Вставлено»
+        meta, meta_col = self._meta()
+        mw = self.f_meta.getlength(meta) if meta else 0
+        mx = bx1 - pad - mw
+        if meta:
+            d.text((mx, cy), meta, font=self.f_meta, fill=(*meta_col, 255), anchor="lm")
+        # посередине — слова в одну строку
+        tx0 = bx0 + pad + ind_w + int(12 * s)
+        tx1 = (mx - int(14 * s)) if meta else (bx1 - pad)
+        area = max(10, int(tx1 - tx0))
+        layer = Image.new("RGBA", (area, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        shown = self.words or [[w, "ph", 0.0, 0.0] for w in self._tokens(self.placeholder)]
+        widths = [self.f_main.getlength(w) if w != "\n" else 0.0 for w, *_ in shown]
+        xs, x = [], 0.0
+        for w in widths:
+            xs.append(x)
+            x += w + (self.space if w else 0.0)
+        total = max(0.0, x - self.space)
+        self.target_xoff = max(0.0, total - area)
+        now = time.time()
+        for (w, style, born, since), x0, ww in zip(shown, xs, widths, strict=True):
+            x = x0 - self.xoff
+            if not ww or x + ww < 0 or x > area:
+                continue
+            k = _ease((now - born) / self.FADE)
+            col = self.COLORS[style]
+            if style == "main":
+                kb = _ease((now - since) / self.BRIGHTEN)
+                g = self.COLORS["live"]
+                col = tuple(int(g[c] + (col[c] - g[c]) * kb) for c in range(3))
+            ld.text((x, H / 2 + (1 - k) * 4 * s), w, font=self.f_main, fill=(*col, int(255 * k)), anchor="lm")
+        if self.xoff > 1:                                     # старые слова растворяются у левого края
+            fade = min(area, int(42 * s))
+            a = np.asarray(layer).copy()
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[None, :] ** 1.5
+            a[:, :fade, 3] = (a[:, :fade, 3] * ramp).astype(np.uint8)
+            layer = Image.fromarray(a, "RGBA")
+        img.alpha_composite(layer, (int(tx0), by0))
+        self.last_size = canvas
+        return img
+
+    def _render_problem(self) -> Image.Image:
+        """Предупреждение (например, «микрофон выключен») — в несколько строк, красным."""
+        s = self.s
+        W = int(self.WIDTH * s)
+        margin, pad = int(36 * s), int(self.PAD_X * s)
+        styles = {"warn": {"font": self.f_main, "fill": (*self.META["warn"], 255)}}
+        lines = wrap_runs([(self.problem, "warn")], styles, W - 2 * pad - int(20 * s))
+        line_h = int(self.f_main.size * 1.45)
+        H = max(int(self.HEIGHT * s), len(lines) * line_h + 2 * int(12 * s))
+        canvas = (W + 2 * margin, H + 2 * margin)
+        bx0, by0 = margin, margin
+        img = self.shadow.make(canvas, (bx0, by0 + int(5 * s), bx0 + W, by0 + H + int(5 * s)))
+        self._body(img, (bx0, by0, bx0 + W, by0 + H), radius=min(H // 2, int(22 * s)))
+        d = ImageDraw.Draw(img)
+        r = 4 * s
+        d.ellipse((bx0 + pad, by0 + H / 2 - r, bx0 + pad + 2 * r, by0 + H / 2 + r), fill=(239, 68, 68, 255))
+        y = by0 + (H - len(lines) * line_h) / 2
+        for line in lines:
+            text = "".join(piece for piece, _ in line).lstrip()
+            d.text((bx0 + pad + int(20 * s), y), text, font=self.f_main, fill=styles["warn"]["fill"])
+            y += line_h
+        self.last_size = canvas
+        return img
 
 
 class LectureBubble(Bubble):

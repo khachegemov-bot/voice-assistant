@@ -73,12 +73,12 @@ from PIL import Image, ImageDraw
 
 from dsp import RATE, rms, spectral_filter, squeeze_pauses
 from recognition import LANG_NAMES, Finalizer, Recognizers, StreamRecognizer, log, run_stream
-from textproc import append_piece, is_filler, split_sentences, tidy
+from textproc import append_piece, apply_replacements, is_filler, parse_replacements, split_sentences, tidy
 
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 HISTORY_MAX = 10
 
 
@@ -117,7 +117,8 @@ class Settings(dict):
     def __init__(self):
         super().__init__({"lang": "auto", "paste": True, "overlay": True, "tr_online": True,
                           "src": "system", "src_app": "", "duck": True, "lec_lang": "en", "link": "",
-                          "mic": "", "auto_unmute": True, "keep_recordings": True})
+                          "mic": "", "auto_unmute": True, "keep_recordings": True, "compact_overlay": True,
+                          "sounds": True, "replacements": ""})
         self.update(load_json(self.FILE, {}))
 
     def set(self, key, value):
@@ -199,22 +200,30 @@ class Stats:
 
 # ─────────────────────────── звук ───────────────────────────
 
-def make_chime(path: Path, notes: list[float], gap: float = 0.12, length: float = 1.1, volume: float = 0.14):
-    """Тихий тёплый звук: чистые низкие тона, мягкое нарастание, долгое плавное затухание.
-    Без звонких обертонов (срезаны фильтром), лёгкая расстройка даёт «воздушность»."""
+def make_chime(path: Path, notes: list[float], gap: float = 0.075, length: float = 0.45, volume: float = 0.11):
+    """Короткий мягкий сигнал — как капля: тёплые низкие тона с плавной атакой и быстрым затуханием,
+    без звонких обертонов, и лёгкое «эхо комнаты» — звук не режет слух и не тянется (≈0,6 с)."""
     sr = 44100
     t = np.arange(int(sr * length)) / sr
-    env = np.minimum(1, t / 0.025) ** 2 * np.exp(-t * 4.2)          # мягкая атака 25 мс
-    out = np.zeros(int(sr * (gap * (len(notes) - 1) + length)))
+    env = (1 - np.exp(-t / 0.008)) * np.exp(-t * 10)                # атака 8 мс, затухание ~0,1 с
+    tail = 0.3
+    out = np.zeros(int(sr * (gap * (len(notes) - 1) + length + tail)))
     for i, f in enumerate(notes):
         tone = (np.sin(2 * np.pi * f * t)
-                + 0.45 * np.sin(2 * np.pi * f * 1.004 * t + 0.7)      # чуть расстроенный двойник — тепло
-                + 0.10 * np.sin(2 * np.pi * f * 2 * t) * np.exp(-t * 12))   # еле слышная «деревянная» атака
-        s = int(i * gap * sr)
-        out[s:s + len(t)] += tone * env * (0.85 if i else 1.0)
-    out = spectral_filter(out, sr, high=1800)                      # убираем звонкость
-    tail = int(sr * 0.08)
-    out[-tail:] *= np.linspace(1, 0, tail)
+                + 0.35 * np.sin(2 * np.pi * f * 1.003 * t + 0.6)      # еле расстроенный двойник — тепло
+                + 0.12 * np.sin(2 * np.pi * f * 2 * t) * np.exp(-t * 35))   # мягкий «стук» в самом начале
+        start = int(i * gap * sr)
+        out[start:start + len(t)] += tone * env * (0.8 if i else 1.0)
+    # эхо комнаты: свёртка с коротким затухающим шумом (через спектр — быстро)
+    n_ir = int(sr * tail)
+    ir = np.random.default_rng(7).normal(0, 1, n_ir) * np.exp(-np.arange(n_ir) / sr * 16)
+    ir = spectral_filter(ir, sr, high=1400)
+    size = len(out) + n_ir
+    wet = np.fft.irfft(np.fft.rfft(out, size) * np.fft.rfft(ir, size), size)[:len(out)]
+    out = out + wet * (0.22 * np.sqrt(np.mean(out ** 2)) / max(np.sqrt(np.mean(wet ** 2)), 1e-9))
+    out = spectral_filter(out, sr, high=1500)                       # убираем звонкость
+    fade = int(sr * 0.06)
+    out[-fade:] *= np.linspace(1, 0, fade)
     out = (out / np.abs(out).max() * volume * 32767).astype(np.int16)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(out.tobytes())
@@ -231,8 +240,12 @@ def make_sounds():
     make_chime(SOUND_POD_OFF, [440.0, 293.66])
 
 
+SOUNDS = {"on": True}                            # выключатель «Звуки» в настройках
+
+
 def play(path: Path):
-    winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+    if SOUNDS["on"]:
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
 
 
 # ─────────────────────────── перевод ───────────────────────────
@@ -617,6 +630,10 @@ class Dictation:
             if fin is not None:
                 fin.done.set()                          # фоновая сверка не должна работать вечно
         lang = sr.lang if sr is not None else lang
+        try:                                                # «Словарь» из настроек: клоуд → Claude
+            final = apply_replacements(final, getattr(self.app, "rules", []))
+        except Exception as e:
+            log("!! словарь замен:", e)
         clear_draft()
         if self.app.settings.get("keep_recordings", True) and sr is not None and sr.all_audio:
             try:                                        # последние 5 записей — для проверки качества (только локально)
@@ -996,6 +1013,7 @@ class App:
         self.settings = Settings()
         self.history = History()
         self.stats = Stats()
+        self.rules = parse_replacements(self.settings.get("replacements", ""))   # словарь замен
         draft = load_json(DRAFT_FILE, None)           # программа упала посреди диктовки — спасаем текст
         self.recovered = bool(draft and draft.get("text", "").strip())
         if self.recovered:
@@ -1031,8 +1049,11 @@ class App:
         dwm(hwnd, 35, r_ | g_ << 8 | b_ << 16)                # заголовок — цвета окна (Windows 11), без «шва»
 
         from overlay_ui import DictationBubble, LectureBubble
-        self.pill = DictationBubble(root, self.scale)
-        self.pill.level_source = lambda: self.dictation.level
+        from overlay_ui import CompactBubble
+        self.pills = {True: CompactBubble(root, self.scale), False: DictationBubble(root, self.scale)}
+        for p in self.pills.values():
+            p.level_source = lambda: self.dictation.level
+        SOUNDS["on"] = self.settings.get("sounds", True)
         self.pod_closed = False
         self.panel = LectureBubble(root, self.scale, on_close=lambda: self.ui("close_panel"),
                                    on_copy=lambda: self.ui("copy_translation"), on_open=os.startfile)
@@ -1070,6 +1091,11 @@ class App:
             root.withdraw()
         self.hidden_hint_shown = start_hidden
         root.after(50, self._poll)
+
+    @property
+    def pill(self):
+        """Окошко диктовки: компактное (одна строка) или большое — как выбрано в настройках."""
+        return self.pills[bool(self.settings.get("compact_overlay", True))]
 
     def px(self, n: float) -> int:
         return int(n * self.scale)
@@ -1294,9 +1320,7 @@ class App:
         if self.settings["link"]:
             self.link_entry.insert(0, self.settings["link"])
         self.link_entry.pack(side="left", fill="x", expand=True)
-        # Ctrl+V при русской раскладке tkinter не понимает — ловим по коду клавиши
-        self.link_entry._entry.bind("<Control-KeyPress>", lambda e: self.link_entry._entry.event_generate(
-            "<<Paste>>") if e.keycode == 86 and e.keysym.lower() != "v" else None)
+        self.fix_shortcuts(self.link_entry._entry)
         ctk.CTkButton(self.link_box.winfo_children()[0], text="Вставить", width=96, height=38, corner_radius=10,
                       font=self._font(13, True), fg_color=C["surface2"], hover_color=C["chip_hover"],
                       command=self.paste_link).pack(side="left", padx=(8, 0))
@@ -1321,6 +1345,7 @@ class App:
                                         text_color=C["text"])
         self.hist_search.pack(side="left")
         self.hist_search.bind("<KeyRelease>", lambda e: self.render_history())
+        self.fix_shortcuts(self.hist_search._entry)
         ctk.CTkButton(tools, text="Очистить", width=10, height=34, corner_radius=10, font=self._font(13),
                       fg_color="transparent", hover_color=C["surface"], text_color=C["muted"],
                       command=self.clear_history).pack(side="left", padx=(8, 0))
@@ -1349,9 +1374,27 @@ class App:
         self.sw_paste = self._switch(s, "Вставлять текст туда, где курсор", "paste",
                                      "Выключено — текст только сохраняется в «Истории».")
         self.sw_overlay = self._switch(s, "Показывать окошко с текстом", "overlay")
+        self.sw_compact = self._switch(s, "Компактное окошко — одна строка", "compact_overlay",
+                                       "Выключено — большое окошко на три строки.")
+        self.sw_sounds = self._switch(s, "Звуки начала и конца записи", "sounds")
         self.settings["autostart"] = autostart_enabled()
         self.sw_autostart = self._switch(s, "Запускать вместе с Windows", "autostart",
                                          "Программа тихо ждёт у часов — Alt+Z работает сразу.")
+        s = self._section(pg, "Словарь", "Слова, которые программа слышит неправильно: «как слышится = как "
+                                         "писать», по одному в строке. Звёздочка — любое окончание.")
+        self.dict_box = ctk.CTkTextbox(s, height=96, corner_radius=10, font=self._font(13), fg_color=C["surface2"],
+                                       text_color=C["text"], border_width=0, wrap="none")
+        self.dict_box.pack(fill="x")
+        if self.settings.get("replacements"):
+            self.dict_box.insert("1.0", self.settings["replacements"])
+        self.dict_box.bind("<KeyRelease>", self._rules_changed)
+        self.dict_box.bind("<FocusOut>", lambda e: self._save_rules())
+        self.fix_shortcuts(self.dict_box._textbox)
+        row = ctk.CTkFrame(s, fg_color="transparent")
+        row.pack(fill="x", pady=(6, 0))
+        self._label(row, "Например:  клоуд* = Claude   ·   джипити = GPT", 12, C["muted"]).pack(side="left")
+        self.dict_count = self._label(row, f"Замен: {len(self.rules)}" if self.rules else "", 12, C["muted"])
+        self.dict_count.pack(side="right")
         s = self._section(pg, "Качество распознавания")
         self.sw_keep = self._switch(s, "Хранить 5 последних записей", "keep_recordings",
                                     "Только на этом компьютере — чтобы при необходимости проверить, как "
@@ -1434,7 +1477,40 @@ class App:
             self.settings[key] = autostart_enabled()
         else:
             self.settings.set(key, value)
+        if key == "compact_overlay":                # сменили вид окошка — прежнее прячем
+            self.pills[not value].hide()
+        if key == "sounds":
+            SOUNDS["on"] = value
+            if value:
+                play(SOUND_ON)                      # сразу слышно, как звучит
         self.refresh_controls()
+
+    def _save_rules(self):
+        self._rules_job = None
+        text = self.dict_box.get("1.0", "end").strip()
+        self.settings.set("replacements", text)
+        self.rules = parse_replacements(text)
+        self.dict_count.configure(text=f"Замен: {len(self.rules)}" if self.rules else "")
+
+    def _rules_changed(self, _e=None):
+        if getattr(self, "_rules_job", None):
+            self.root.after_cancel(self._rules_job)
+        self._rules_job = self.root.after(500, self._save_rules)
+
+    @staticmethod
+    def fix_shortcuts(widget):
+        """Ctrl+V/C/X/A при русской раскладке: tkinter узнаёт клавишу по букве, а не по коду, и
+        «Ctrl+М» для него — не вставка. Ловим по коду клавиши."""
+        events = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+
+        def on_key(e):
+            ev = events.get(e.keycode)
+            if ev and not e.keysym.isascii():
+                widget.event_generate(ev)
+                return "break"
+            return None
+
+        widget.bind("<Control-KeyPress>", on_key, add="+")
 
     def render_history(self):
         for w in self.list.winfo_children():
@@ -1469,7 +1545,8 @@ class App:
         for seg, value in ((self.lang_seg, s["lang"]), (self.mode_seg, s["tr_online"]),
                            (self.src_seg, s["src"]), (self.lec_seg, s["lec_lang"])):
             seg.set(seg.labels[value])
-        for sw in (self.sw_paste, self.sw_overlay, self.sw_duck, self.sw_autostart, self.sw_unmute, self.sw_keep):
+        for sw in (self.sw_paste, self.sw_overlay, self.sw_duck, self.sw_autostart, self.sw_unmute, self.sw_keep,
+                   self.sw_compact, self.sw_sounds):
             sw.select() if s[sw.key] else sw.deselect()
         for box in (self.sys_box, self.app_box, self.link_box):
             box.pack_forget()
@@ -1544,6 +1621,8 @@ class App:
             committed, live = args
             if not committed and not live and self.mic_warning:
                 return                              # не затираем предупреждение о микрофоне
+            if self.rules:                          # словарь замен — сразу и в окошке
+                committed, live = apply_replacements(committed, self.rules), apply_replacements(live, self.rules)
             self.pill.set_text(committed, live, "Говорите…")
             if show_ov and self.recording:
                 self.pill.show()

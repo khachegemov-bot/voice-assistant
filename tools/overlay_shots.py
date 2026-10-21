@@ -6,7 +6,7 @@ from pathlib import Path
 
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from overlay_ui import DictationBubble, LectureBubble  # noqa: E402
+from overlay_ui import CompactBubble, DictationBubble, LectureBubble  # noqa: E402
 
 OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
@@ -37,7 +37,13 @@ d.set_state("rec", "ru")
 d.set_ready()
 d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал, сделай HTML-версию",
            "очень красивую в стиле Apple")
-save(d, "7_bubble_dictation")
+save(d, "7b_bubble_full")
+c = CompactBubble(root, scale)
+c.level_source = d.level_source
+c.set_state("rec", "ru")
+c.set_ready()
+c.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал,", "сделай HTML-версию")
+save(c, "7_bubble_dictation")
 d.set_state("done")
 d.set_text("Добрый день! Высылаю отчёт по проекту, все цифры сверены.", "")
 save(d, "7c_bubble_done")
