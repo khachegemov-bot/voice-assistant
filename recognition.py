@@ -153,6 +153,7 @@ class StreamRecognizer:
         self.voice_since_step = False                 # был ли голос с прошлого шага
         self.voice_samples = 0                        # сколько всего звучал голос
         self.detect = False                           # «Авто»: язык ещё уточняется по голосу
+        self.fast_step = None                         # чаще обновлять, пока буфер короткий (диктовка)
         self.on_lang = lambda lang: None
 
     def feed(self, audio: np.ndarray):
@@ -219,7 +220,8 @@ class StreamRecognizer:
         return re.sub(r"[^\w']", "", word.lower())
 
     def step(self):
-        if len(self.buf) - self.decoded < self.STEP * RATE:
+        step = self.fast_step if self.fast_step and len(self.buf) < 6 * RATE else self.STEP
+        if len(self.buf) - self.decoded < step * RATE:
             return
         quiet = self._quiet(self.buf[self.decoded:])
         self.voice_since_step = False

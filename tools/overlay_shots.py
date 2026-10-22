@@ -6,7 +6,7 @@ from pathlib import Path
 
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from overlay_ui import CompactBubble, DictationBubble, LectureBubble  # noqa: E402
+from overlay_ui import AquaBubble, CompactBubble, LectureBubble  # noqa: E402
 
 OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
@@ -25,28 +25,26 @@ def settle(bubble, frames: int = 25):
 
 
 def save(bubble, name):
-    settle(bubble)
+    settle(bubble, 50)
     bubble.render().save(OUT / f"{name}.png")
     print("картинка:", name, flush=True)
 
 
-d = DictationBubble(root, scale)
-_levels = iter([0.002, 0.004, 0.03, 0.06, 0.05, 0.08, 0.04] * 40)
+d = AquaBubble(root, scale)
+_levels = iter([0.002, 0.004, 0.03, 0.06, 0.05, 0.08, 0.04] * 400)
 d.level_source = lambda: next(_levels, 0.05)
+d.set_context("Chrome: claude.ai", "Realtek Audio")
 d.set_state("rec", "ru")
 d.set_ready()
-d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал, сделай HTML-версию",
-           "очень красивую в стиле Apple")
-save(d, "7b_bubble_full")
+d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал,",
+           "сделай HTML-версию очень красивую в стиле Apple")
+save(d, "7_bubble_dictation")
 c = CompactBubble(root, scale)
 c.level_source = d.level_source
 c.set_state("rec", "ru")
 c.set_ready()
 c.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал,", "сделай HTML-версию")
-save(c, "7_bubble_dictation")
-d.set_state("done")
-d.set_text("Добрый день! Высылаю отчёт по проекту, все цифры сверены.", "")
-save(d, "7c_bubble_done")
+save(c, "7b_bubble_line")
 
 lec = LectureBubble(root, scale, on_close=lambda: None, on_copy=lambda: None, on_open=lambda p: None)
 lec.src_title, lec.lang = "Лекция по ссылке", "en"

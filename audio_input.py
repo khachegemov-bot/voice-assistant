@@ -124,6 +124,7 @@ class MicStream:
         self.name, self.on_audio = name, on_audio
         self.stream = None
         self.mode = ""
+        self.device_name = ""
 
     def _open_wasapi(self, dev: int):
         import soxr
@@ -146,6 +147,7 @@ class MicStream:
             self.stream = None
             raise
         self.mode = f"WASAPI {sr // 1000} кГц × {ch} кан."
+        self.device_name = info["name"]
 
     def __enter__(self):
         with _pa_lock:
@@ -166,6 +168,10 @@ class MicStream:
                                          callback=lambda d, *_: self.on_audio(d[:, 0].copy()))
             self.stream.start()
             self.mode = "MME 16 кГц"
+            try:
+                self.device_name = sd.query_devices(self.stream.device, "input")["name"]
+            except Exception:                   # noqa: BLE001
+                self.device_name = ""
         return self
 
     def __exit__(self, *exc):
