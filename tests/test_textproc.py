@@ -141,3 +141,40 @@ def test_apply_replacements():
 
 def test_replacement_is_whole_word_only():
     assert apply_replacements("переклоудка", [("клоуд", "Claude")]) == "переклоудка"
+
+
+# ── стоп-слово ──
+
+from textproc import ends_with_stop_word, parse_stop_words, strip_stop_word  # noqa: E402
+
+STOPS = parse_stop_words("отправь, Send")
+
+
+def test_parse_stop_words():
+    assert STOPS == ["отправь", "send"]
+
+
+@pytest.mark.parametrize("text", ["Привет. Как дела? Отправь.", "Купи хлеб и молоко, отправь.", "Hello there. Send!",
+                                  "Отправьте.", "Ну всё, отправ", "Отправь"])
+def test_stop_word_at_the_end(text):
+    assert ends_with_stop_word(text, STOPS)
+
+
+@pytest.mark.parametrize("text", ["Отправь письмо Маше.", "Я отправлю завтра.", "Завтра я отправлю.", "Привет.", ""])
+def test_no_stop_word(text):
+    assert not ends_with_stop_word(text, STOPS)
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("Привет. Как дела? Отправь.", "Привет. Как дела?"),
+    ("Купи хлеб и молоко, отправь.", "Купи хлеб и молоко."),
+    ("Напиши Маше, что я опоздаю. Отправь!", "Напиши Маше, что я опоздаю."),
+    ("Отправь.", ""),
+    ("Отправь письмо Маше.", "Отправь письмо Маше."),
+])
+def test_strip_stop_word(raw, clean):
+    assert strip_stop_word(raw, STOPS) == clean
+
+
+def test_stop_words_off():
+    assert not ends_with_stop_word("Как дела? Отправь.", []) and strip_stop_word("Отправь.", []) == "Отправь."

@@ -154,6 +154,8 @@ class StreamRecognizer:
         self.voice_samples = 0                        # сколько всего звучал голос
         self.detect = False                           # «Авто»: язык ещё уточняется по голосу
         self.fast_step = None                         # чаще обновлять, пока буфер короткий (диктовка)
+        self.offset = 0                               # с какого отсчёта всей записи начинается буфер
+        self.last_word_at = 0.0                       # когда (с начала записи) прозвучало последнее засчитанное слово
         self.on_lang = lambda lang: None
 
     def feed(self, audio: np.ndarray):
@@ -210,7 +212,15 @@ class StreamRecognizer:
             return res[lang][0], False
         return words, True
 
+    def _drop(self, n: int):
+        """Выбросить из буфера первые n отсчётов (помним, сколько выброшено, — чтобы знать время слов)."""
+        n = max(0, min(n, len(self.buf)))
+        self.buf = self.buf[n:]
+        self.offset += n
+
     def _emit(self, words):
+        if words:
+            self.last_word_at = self.offset / RATE + words[-1][1]
         text = tidy(" ".join(w for w, _ in words).strip())
         if text and not is_filler(text):
             self.on_commit(text)
@@ -226,7 +236,7 @@ class StreamRecognizer:
         quiet = self._quiet(self.buf[self.decoded:])
         self.voice_since_step = False
         if quiet and not self.prev:                   # тишина и дописывать нечего — не тратим процессор
-            self.buf = self.buf[-RATE // 2:]
+            self._drop(len(self.buf) - RATE // 2)
             self.decoded = len(self.buf)
             return
         words, lp = self._recognize_lp(self.buf)
@@ -268,13 +278,13 @@ class StreamRecognizer:
                 cut = min(dur, words[upto - 1][1] + 0.6)
             cut = max(0.0, cut)
             self._emit(words[:upto])
-            self.buf = self.buf[int(cut * RATE):]
+            self._drop(int(cut * RATE))
             self.decoded = len(self.buf)
             self.prev = [(w, t - cut) for w, t in rest]
         else:
             self.prev = words
             if not words and dur > 5:                 # долго ничего не распознаётся — шум/музыка
-                self.buf = self.buf[-RATE:]
+                self._drop(len(self.buf) - RATE)
                 self.decoded = len(self.buf)
         self.on_live(re.sub(r"[.…]+$", "", " ".join(w for w, _ in self.prev)))
 
@@ -312,6 +322,7 @@ class Finalizer:
         self.text = ""
         self.lock = threading.Lock()
         self.done = threading.Event()
+        self.limit = 0                                # >0 — сверять звук только до этого отсчёта (стоп-слово)
         self.thread = threading.Thread(target=self._loop, daemon=True, name="finalizer")
 
     def start(self):
@@ -359,6 +370,8 @@ class Finalizer:
         self.done.set()
         with self.lock:
             audio = self._audio()
+            if self.limit > self.pos:                 # звук после стоп-слова (и само слово) не нужен
+                audio = audio[:self.limit]
             pos = self.pos
             if len(audio) - pos > self.MAX_TAIL * RATE:
                 log(f"сверка отстала на {(len(audio) - pos) / RATE:.0f} с — вставляю живой текст")

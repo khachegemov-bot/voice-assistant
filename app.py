@@ -73,12 +73,13 @@ from PIL import Image, ImageDraw
 
 from dsp import RATE, rms, spectral_filter, squeeze_pauses
 from recognition import LANG_NAMES, Finalizer, Recognizers, StreamRecognizer, log, run_stream
-from textproc import append_piece, apply_replacements, is_filler, parse_replacements, split_sentences, tidy
+from textproc import (append_piece, apply_replacements, ends_with_stop_word, is_filler, parse_replacements,
+                      parse_stop_words, split_sentences, strip_stop_word, tidy)
 
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 HISTORY_MAX = 10
 
 
@@ -118,7 +119,7 @@ class Settings(dict):
         super().__init__({"lang": "auto", "paste": True, "overlay": True, "tr_online": True,
                           "src": "system", "src_app": "", "duck": True, "lec_lang": "en", "link": "",
                           "mic": "", "auto_unmute": True, "keep_recordings": True, "overlay_line": False,
-                          "sounds": True, "replacements": ""})
+                          "sounds": True, "replacements": "", "stop_word_on": True, "stop_word": "отправь"})
         self.update(load_json(self.FILE, {}))
 
     def set(self, key, value):
@@ -551,6 +552,7 @@ class Dictation:
     """Микрофон → потоковое распознавание → живой текст в окошке → вставка по окончании."""
 
     CHIME = 0.45            # столько звучит сигнал «начали» — его не записываем
+    STOP_PAUSE = 1.0        # с тишины после стоп-слова — и диктовка заканчивается
 
     def __init__(self, app: "App"):
         self.app = app
@@ -615,6 +617,10 @@ class Dictation:
         text, live = "", ""
         sr = fin = None
         final = ""
+        settings = self.app.settings
+        stops = parse_stop_words(settings.get("stop_word", "")) if settings.get("stop_word_on", True) else []
+        said_stop = [False]
+        stop_at = [0.0]
         try:
             def on_commit(piece: str):
                 # на экран — вместе с живым хвостом в on_live (раньше хвост на миг пропадал и печатался заново)
@@ -622,6 +628,21 @@ class Dictation:
                 text = append_piece(text, piece, sr.lang)
                 log("»", piece)
                 save_draft(text, sr.lang)             # автосохранение: при сбое текст не пропадёт
+                # стоп-слово последним перед паузой («…Отправь.») — заканчиваем без Alt+Z
+                if stops and not said_stop[0] and ends_with_stop_word(text, stops):
+                    said_stop[0] = True
+                    word_at = sr.last_word_at
+                    threading.Timer(self.STOP_PAUSE, confirm_stop, args=(sr.voice_samples, word_at)).start()
+
+            def confirm_stop(voice_before: int, word_at: float):
+                # после слова секунда тишины — это команда; заговорили снова — слово было частью фразы
+                # («…и отправь… ей фото»), продолжаем слушать
+                if sr.voice_samples - voice_before < RATE * 0.15:
+                    log("стоп-слово — заканчиваю диктовку")
+                    stop_at[0] = max(0.0, word_at - 0.15)     # перепроверка — только до стоп-слова
+                    self._say(session, "stop_word")
+                else:
+                    said_stop[0] = False
 
             def on_live(tail: str):
                 nonlocal live
@@ -639,6 +660,8 @@ class Dictation:
             fin = Finalizer(self.app.asr, sr)
             fin.start()
             run_stream(q, sr, alive=lambda: True)
+            if stop_at[0]:
+                fin.limit = int(stop_at[0] * RATE)
             final = self._final_pass(sr, fin, text.strip(), live, session)
         except Exception as e:                          # что бы ни случилось — текст не теряем
             log("!! диктовка:", e)
@@ -649,6 +672,7 @@ class Dictation:
             if fin is not None:
                 fin.done.set()                          # фоновая сверка не должна работать вечно
         lang = sr.lang if sr is not None else lang
+        final = strip_stop_word(final, stops)               # само стоп-слово в текст не вставляем
         try:                                                # «Словарь» из настроек: клоуд → Claude
             final = apply_replacements(final, getattr(self.app, "rules", []))
         except Exception as e:
@@ -712,7 +736,10 @@ class Dictation:
             log("!! итоговая сверка:", e)
             return whole
         streamed = whole
-        if not text or len(text.split()) < len(streamed.split()) * 0.85:
+        # сверка потеряла заметную часть слов — оставляем живой текст; на коротком тексте разница в 1–2 слова —
+        # это обычно лишнее «Да» или «Ну» живого распознавания на стыке, а не потеря
+        n_live = len(streamed.split())
+        if not text or len(text.split()) < n_live - max(2, 0.15 * n_live):
             log("итоговая сверка короче потоковой — оставляю потоковую")
             return streamed
         if text != streamed:
@@ -1256,8 +1283,7 @@ class App:
         self.home_title = pg.title_lbl
         self.hero = Hero(pg, self.scale, bg=C["bg"], colors=("#1d4ed8", "#7c3aed"), glyph=ICONS["mic"],
                          accent="#2563eb", eyebrow="Диктовка", title="Говорите — я напишу",
-                         subtitle="Нажмите Alt+Z в любом окне и говорите. Ещё раз Alt+Z — текст встанет туда, "
-                                  "где курсор.", hotkey="Alt + Z", command=self.toggle_record,
+                         subtitle=self._hero_hint(), hotkey="Alt + Z", command=self.toggle_record,
                          level_source=lambda: self.dictation.level, ui_font=UI_FONT)
         self.hero.pack(fill="x")
         stats = ctk.CTkFrame(pg, fg_color="transparent")
@@ -1399,6 +1425,16 @@ class App:
         self.sw_compact = self._switch(s, "Окошко в одну строку", "overlay_line",
                                        "Выключено — окошко растёт вместе с текстом.")
         self.sw_sounds = self._switch(s, "Звуки начала и конца записи", "sounds")
+        self.sw_stop = self._switch(s, "Заканчивать диктовку стоп-словом", "stop_word_on",
+                                    "Скажите его последним и сделайте паузу — текст вставится сам, без Alt+Z. "
+                                    "Можно несколько слов через запятую.")
+        self.stop_entry = ctk.CTkEntry(s, height=34, corner_radius=10, font=self._font(13), fg_color=C["surface2"],
+                                       border_color=C["border"], text_color=C["text"], placeholder_text="отправь")
+        self.stop_entry.insert(0, self.settings.get("stop_word", "отправь"))
+        self.stop_entry.pack(fill="x", pady=(2, 6))
+        self.stop_entry.bind("<KeyRelease>", lambda e: self._save_stop_word())
+        self.stop_entry.bind("<FocusOut>", lambda e: self._save_stop_word())
+        self.fix_shortcuts(self.stop_entry._entry)
         self.settings["autostart"] = autostart_enabled()
         self.sw_autostart = self._switch(s, "Запускать вместе с Windows", "autostart",
                                          "Программа тихо ждёт у часов — Alt+Z работает сразу.")
@@ -1427,6 +1463,7 @@ class App:
                       command=self.open_recordings).pack(anchor="w", pady=(8, 0))
         s = self._section(pg, "Как пользоваться")
         for line in ("Alt+Z — начать, ещё раз Alt+Z — вставить текст туда, где курсор.",
+                     "Закончить можно и голосом: скажите «отправь» последним и сделайте паузу.",
                      "Голосом: «новая строка», «новый абзац» · «new line», «new paragraph».",
                      "Alt+X — записать лекцию или подкаст, ещё раз Alt+X — перевод.",
                      "Закрытие окна не выключает программу — она ждёт у часов. Выход — через значок там же."):
@@ -1501,11 +1538,24 @@ class App:
             self.settings.set(key, value)
         if key == "overlay_line":                   # сменили вид окошка — прежнее прячем
             self.pills[not value].hide()
+        if key == "stop_word_on" and hasattr(self, "hero"):
+            self.hero.set_text(subtitle=self._hero_hint())
         if key == "sounds":
             SOUNDS["on"] = value
             if value:
                 play(SOUND_ON)                      # сразу слышно, как звучит
         self.refresh_controls()
+
+    def _save_stop_word(self):
+        word = self.stop_entry.get().strip()
+        if word != self.settings.get("stop_word"):
+            self.settings.set("stop_word", word)
+            self.hero.set_text(subtitle=self._hero_hint())
+
+    def _hero_hint(self) -> str:
+        stops = parse_stop_words(self.settings.get("stop_word", "")) if self.settings.get("stop_word_on") else []
+        end = f"скажите «{stops[0]}» или нажмите Alt+Z ещё раз" if stops else "ещё раз нажмите Alt+Z"
+        return f"Нажмите Alt+Z в любом окне и говорите. В конце {end} — текст встанет туда, где курсор."
 
     def _save_rules(self):
         self._rules_job = None
@@ -1568,7 +1618,7 @@ class App:
                            (self.src_seg, s["src"]), (self.lec_seg, s["lec_lang"])):
             seg.set(seg.labels[value])
         for sw in (self.sw_paste, self.sw_overlay, self.sw_duck, self.sw_autostart, self.sw_unmute, self.sw_keep,
-                   self.sw_compact, self.sw_sounds):
+                   self.sw_compact, self.sw_sounds, self.sw_stop):
             sw.select() if s[sw.key] else sw.deselect()
         for box in (self.sys_box, self.app_box, self.link_box):
             box.pack_forget()
@@ -1631,7 +1681,7 @@ class App:
         self.root.after(30 if active else 80, self._poll)
 
     DICT_EVENTS = {"dict_update", "dict_ready", "dict_lang", "dict_done", "mic_problem", "mic_failed",
-                   "paste_blocked"}
+                   "paste_blocked", "stop_word"}
 
     def _handle(self, kind, *args):
         if kind in self.DICT_EVENTS:
@@ -1662,6 +1712,9 @@ class App:
             if show_ov and self.recording:
                 self.pill.show()
                 self.layout_overlays()
+        elif kind == "stop_word":                   # сказали стоп-слово — как второе нажатие Alt+Z
+            if self.recording:
+                self.toggle_record()
         elif kind == "dict_ready":                  # микрофон открылся — индикатор голоса оживает
             self.pill.set_ready()
         elif kind == "dict_lang":                   # «Авто»: язык определён по голосу

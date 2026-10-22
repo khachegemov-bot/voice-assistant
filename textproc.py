@@ -133,3 +133,37 @@ def tokens_to_words(tokens: list[str], times: list[float]) -> list[tuple[str, fl
         else:
             words[-1][0] += tok
     return [(w, t) for w, t in words]
+
+
+# ── стоп-слово: «…и вот это всё. Отправь.» — диктовка заканчивается сама ──
+
+def _norm_stop(word: str) -> str:
+    return re.sub(r"[^\w]", "", word.lower().replace("ё", "е"))
+
+
+def parse_stop_words(text: str) -> list[str]:
+    """«отправь, send» → ["отправь", "send"]."""
+    return [w for w in (_norm_stop(x) for x in re.split(r"[,;\n]+", text or "")) if w]
+
+
+def _is_stop(word: str, stops: list[str]) -> bool:
+    w = _norm_stop(word)
+    # «отправь», вежливое «отправьте» и «отправ» (модель иногда теряет мягкий знак) — но не «отправлю»
+    return bool(w) and any(w in (s, s + "те", s[:-1] if s.endswith("ь") else s) for s in stops)
+
+
+def ends_with_stop_word(text: str, stops: list[str]) -> bool:
+    """Последнее слово текста — стоп-слово («…как дела? Отправь.»)."""
+    words = text.split()
+    return bool(stops and words and _is_stop(words[-1], stops))
+
+
+def strip_stop_word(text: str, stops: list[str]) -> str:
+    """Убрать стоп-слово в конце: «Купи хлеб, отправь.» → «Купи хлеб.», «Как дела? Отправь.» → «Как дела?»."""
+    words = text.rstrip().split(" ")
+    if not (stops and words and _is_stop(words[-1], stops)):
+        return text
+    rest = " ".join(words[:-1]).rstrip()
+    if rest.endswith((",", ";", ":", "—", "-")):
+        rest = rest.rstrip(",;:—- ") + "."
+    return rest

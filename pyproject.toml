@@ -1,6 +1,6 @@
 [project]
 name = "voice-assistant"
-version = "1.8.0"
+version = "1.9.0"
 description = "Голосовой помощник для Windows: диктовка, запись лекций и перевод — распознавание речи офлайн"
 requires-python = ">=3.12"
 license = "MIT"
