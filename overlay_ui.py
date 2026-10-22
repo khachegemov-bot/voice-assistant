@@ -136,15 +136,13 @@ class LayeredWindow:
         """Показать картинку RGBA в точке (x, y) экрана с общей прозрачностью alpha."""
         self.img, self.pos = img, (x, y)
         w, h = img.size
-        a = np.asarray(img, dtype=np.uint16)
-        rgb = a[..., :3] * a[..., 3:4] // 255                      # «премультипликация» альфы
-        bgra = np.dstack([rgb[..., 2], rgb[..., 1], rgb[..., 0], a[..., 3]]).astype(np.uint8)
+        bgra = img.convert("RGBa").tobytes("raw", "BGRa")          # «премультипликация» альфы — силами Pillow
         screen = user32.GetDC(None)
         mem = gdi32.CreateCompatibleDC(screen)
         bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
         bits = ctypes.c_void_p()
         hbmp = gdi32.CreateDIBSection(mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        ctypes.memmove(bits, bgra.tobytes(), w * h * 4)
+        ctypes.memmove(bits, bgra, w * h * 4)
         old = gdi32.SelectObject(mem, hbmp)
         size = wintypes.SIZE(w, h)
         src = wintypes.POINT(0, 0)
@@ -460,7 +458,10 @@ class Bubble:
     def _start_tick(self):
         if not self._ticking:
             self._ticking = True
-            self.root.after(self.TICK_MS, self._tick)
+            self.root.after(self.tick_ms(), self._tick)
+
+    def tick_ms(self) -> int:
+        return self.TICK_MS
 
     def _tick(self):
         """Анимация (пульсация точки и т. п.), пока окно видно."""
@@ -472,7 +473,7 @@ class Bubble:
                 self.refresh()
         except Exception as e:                                  # noqa: BLE001
             print("overlay tick:", e, flush=True)
-        self.root.after(self.TICK_MS, self._tick)
+        self.root.after(self.tick_ms(), self._tick)
 
     def animate(self) -> bool:
         """Сдвинуть анимацию на кадр; True — надо перерисовать."""
@@ -764,44 +765,34 @@ class DictationBubble(Bubble):
 
 
 class AquaBubble(DictationBubble):
-    """Окошко диктовки в духе Aqua Voice.
+    """Окошко диктовки в духе Aqua Voice — небольшое, без лишнего.
 
-    • Небольшое: начинается с одной строки и плавно растёт, когда текста становится больше (до 5 строк,
-      дальше старые строки мягко уходят вверх).
+    • Начинается с одной строки и плавно растёт, когда текста становится больше (до 4 строк, дальше
+      старые строки мягко уходят вверх).
     • Слова, которые ещё уточняются, чуть размыты; когда фраза засчитана — становятся чёткими. Поэтому
       правки модели выглядят как «проявление», а не как прыжки текста.
     • Новые слова появляются не пачкой, а одно за другим — ввод не «замирает» между обновлениями.
-    • Синяя точка-курсор дышит в такт голосу. Внизу — куда вставится текст, какой микрофон и кнопка «стоп»."""
-    WIDTH = 440
-    MAX_LINES = 5
-    TICK_MS = 16             # ~60 кадров в секунду — рост окна и проявление слов
-    CLICKABLE = True         # кнопка «стоп»
+    • Синяя точка-курсор дышит в такт голосу.
+
+    Неподвижные части (тень, блок, текст) рисуются один раз и запоминаются; каждый кадр — только курсор
+    и значок. 60 кадров в секунду — пока что-то движется, 30 — когда только дышит курсор."""
+    WIDTH = 400
+    MAX_LINES = 4
+    TICK_MS = 16
     SHARPEN = 0.35           # с — засчитанное слово из размытого становится чётким
-    RADIUS = 26
+    RADIUS = 22
 
     def __init__(self, root, scale):
         super().__init__(root, scale)
         s = scale
-        self.f_main = _font("seguisb.ttf", int(16.5 * s))
+        self.f_main = _font("seguisb.ttf", int(15.5 * s))
         self.line_h = int(self.f_main.size * 1.42)
         self.space = self.f_main.getlength(" ")
         self.anim_h = float(self.line_h)
-        self.f_strip = _font("segoeui.ttf", int(11.5 * s))
-        self.f_strip_b = _font("seguisb.ttf", int(11.5 * s))
-        self.target = ""                  # куда вставится текст: «Chrome: claude.ai»
-        self.mic = ""
-        self.on_stop = None
-        self.stop_box = None
-        self.hover_stop = False
-        self._body_h_cache: dict = {}
-        self.win.on_click = self._click
-        self.win.on_move = self._move
-
-    def set_context(self, target: str = "", mic: str = ""):
-        if target:
-            self.target = target
-        if mic:
-            self.mic = mic
+        self._box_cache: dict = {}
+        self._base = None                 # (ключ, картинка без курсора и значка, где курсор)
+        self._moving = True
+        self._growing = False
 
     # — слова появляются одно за другим, а не пачкой —
     def _apply(self, committed: str, live: str):
@@ -813,57 +804,37 @@ class AquaBubble(DictationBubble):
             for i, w in enumerate(fresh):
                 w[2] = t + i * step
 
-    # — мышь: кнопка «стоп» —
-    def _hit_stop(self, x, y) -> bool:
-        b = self.stop_box
-        return bool(b) and b[0] <= x <= b[2] and b[1] <= y <= b[3]
-
-    def _click(self, x, y):
-        if self._hit_stop(x, y) and self.on_stop and self.state == "rec":
-            self.on_stop()
-
-    def _move(self, x, y):
-        over = self._hit_stop(x, y) and self.state == "rec"
-        self.win.hover_hand = over
-        self.hover_stop = over
+    def tick_ms(self) -> int:
+        return 16 if self._growing else 33          # 60 кадров/с — пока окошко растёт, иначе хватает 30
 
     # — отрисовка —
-    def _box(self, w: int, h: int, strip_h: int) -> Image.Image:
-        """Чёрный блок с большими скруглениями и чуть более светлой полоской снизу."""
-        key = (w, h, strip_h)
-        img = self._body_h_cache.get(key)
+    def _box(self, w: int, h: int) -> Image.Image:
+        key = (w, h)
+        img = self._box_cache.get(key)
         if img is None:
             s = self.s
-            r = int(self.RADIUS * s)
+            r = min(int(self.RADIUS * s), h // 2)
             img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             mask = Image.new("L", (w, h), 0)
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), r, fill=255)
-            fill = Image.new("RGBA", (w, h), (6, 6, 8, 250))
-            ImageDraw.Draw(fill).rectangle((0, h - strip_h, w, h), fill=(22, 22, 25, 252))
-            img.paste(fill, (0, 0), mask)
-            d = ImageDraw.Draw(img)
-            d.line((0, h - strip_h, w, h - strip_h), fill=(255, 255, 255, 16), width=max(1, int(s)))
-            d.rounded_rectangle((0, 0, w - 1, h - 1), r, outline=(255, 255, 255, 30), width=max(1, int(s)))
-            if len(self._body_h_cache) > 40:
-                self._body_h_cache.clear()
-            self._body_h_cache[key] = img
+            img.paste(Image.new("RGBA", (w, h), (6, 6, 8, 250)), (0, 0), mask)
+            ImageDraw.Draw(img).rounded_rectangle((0, 0, w - 1, h - 1), r, outline=(255, 255, 255, 30),
+                                                  width=max(1, int(s)))
+            if len(self._box_cache) > 40:
+                self._box_cache.clear()
+            self._box_cache[key] = img
         return img
 
-    @staticmethod
-    def _fit(font, text: str, width: float) -> str:
-        if font.getlength(text) <= width:
-            return text
-        while text and font.getlength(text + "…") > width:
-            text = text[:-1]
-        return text.rstrip() + "…"
+    def _geometry(self):
+        s = self.s
+        return dict(W=int(self.WIDTH * s), pad_x=int(20 * s), pad_top=int(19 * s), pad_bot=int(15 * s),
+                    margin=int(34 * s), badge_h=int(30 * s), cursor_room=int(22 * s))
 
     def render(self) -> Image.Image:
         s = self.s
-        W = int(self.WIDTH * s)
-        pad_x, pad_top, pad_bot = int(24 * s), int(22 * s), int(14 * s)
-        strip_h = int(34 * s)
-        margin, badge_h = int(40 * s), int(30 * s)
-        cursor_room = int(24 * s)
+        g = self._geometry()
+        W, pad_x, pad_top, pad_bot = g["W"], g["pad_x"], g["pad_top"], g["pad_bot"]
+        margin, badge_h = g["margin"], g["badge_h"]
         text_w = W - 2 * pad_x
         if self.problem:
             shown = [[w, "warn", 0.0, 0.0] for w in self._tokens(self.problem)]
@@ -872,7 +843,7 @@ class AquaBubble(DictationBubble):
         else:
             shown = [[w, "ph", 0.0, 0.0] for w in self._tokens(self.placeholder)]
         saved, self.words = self.words, shown
-        lines = self._layout(text_w - cursor_room)
+        lines = self._layout(text_w - g["cursor_room"])
         self.words = saved
         # окно растёт и курсор движется вслед за уже показанными словами, а не за теми, что ещё появятся
         now = time.time()
@@ -888,44 +859,82 @@ class AquaBubble(DictationBubble):
             self.shift = max(-2.0 * self.line_h, min(2.0 * self.line_h, self.shift))
             self.n_lines = len(lines)
         text_h = max(1, int(round(self.anim_h)))
-        box_h = pad_top + text_h + pad_bot + strip_h
-        max_box_h = pad_top + self.MAX_LINES * self.line_h + pad_bot + strip_h
-        canvas = (W + 2 * margin, badge_h // 2 + max_box_h + 2 * margin)
-        bx0, bx1 = margin, margin + W
+        box_h = pad_top + text_h + pad_bot
+        canvas = (W + 2 * margin, badge_h // 2 + pad_top + self.MAX_LINES * self.line_h + pad_bot + 2 * margin)
+        bx0 = margin
         by1 = canvas[1] - margin
         by0 = by1 - box_h
-        img = self.shadow.make(canvas, (bx0, by0 + int(8 * s), bx1, by1 + int(8 * s)))
-        img.alpha_composite(self._box(W, box_h, strip_h), (bx0, by0))
 
-        # текст: чёткий слой (засчитанное) + мягко размытый (уточняется) + лёгкое свечение
+        # слова в движении (проявляются, становятся чёткими) — рисуем заново; иначе берём запомненное
+        settled = all((now - w[2]) >= self.FADE and (w[1] != "main" or (now - w[3]) >= self.SHARPEN)
+                      for w in shown)
+        key = (tuple((w[0], w[1]) for w in shown), text_h, round(self.shift, 1), len(lines))
+        target_h = max(1, min(self.MAX_LINES, len(lines))) * self.line_h
+        self._growing = abs(self.shift) > 0.5 or abs(self.anim_h - target_h) > 0.5
+        self._moving = not settled or self._growing or self._pending is not None
+        if settled and self._base is not None and self._base[0] == key:
+            base, (x_end, y_last) = self._base[1], self._base[2]
+        else:
+            base, x_end, y_last = self._draw_base(canvas, shown, lines, text_w, text_h, bx0, by0, by1, g, now)
+            self._base = (key, base, (x_end, y_last)) if settled else None
+        img = base.copy()
+
+        # курсор: синяя точка дышит в такт голосу; «уточняю» — фиолетовая
+        if self.state in ("rec", "busy"):
+            tx, ty = bx0 + pad_x, by0 + pad_top
+            cx = tx + (x_end + int(12 * s) if x_end else int(6 * s))
+            cy = ty + min(max(y_last, 0), text_h - self.line_h) + self.line_h * 0.5
+            if self.state == "busy":
+                col, r = (167, 139, 250), 6 * s * (0.85 + 0.15 * self.pulse)
+            else:
+                col, r = (59, 130, 246), 6 * s * (0.9 + 0.45 * self.level)
+            a = int(150 + 105 * self.pulse) if self.ready or self.state == "busy" else 110
+            glow = Image.new("RGBA", (int(r * 6), int(r * 6)), (0, 0, 0, 0))
+            ImageDraw.Draw(glow).ellipse((r * 1.5, r * 1.5, r * 4.5, r * 4.5), fill=(*col, a // 2))
+            img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(r * 0.8)), (int(cx - r * 3), int(cy - r * 3)))
+            d = ImageDraw.Draw(img)
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(*col, a))
+            d.ellipse((cx - r * 0.45, cy - r * 0.75, cx + r * 0.25, cy - r * 0.15), fill=(255, 255, 255, a // 3))
+        self._draw_badge(img, bx0 + W // 2, by0 - badge_h // 2)
+        self.last_size = (canvas[0], badge_h // 2 + box_h + 2 * margin)
+        return img
+
+    def _draw_base(self, canvas, shown, lines, text_w, text_h, bx0, by0, by1, g, now):
+        """Тень, блок и текст (чёткий слой + мягко размытый + лёгкое свечение)."""
+        s = self.s
+        W = g["W"]
+        img = self.shadow.make(canvas, (bx0, by0 + int(7 * s), bx0 + W, by1 + int(7 * s)))
+        img.alpha_composite(self._box(W, by1 - by0), (bx0, by0))
         sharp = Image.new("RGBA", (text_w, text_h), (0, 0, 0, 0))
         soft = Image.new("RGBA", (text_w, text_h), (0, 0, 0, 0))
         ds, dsoft = ImageDraw.Draw(sharp), ImageDraw.Draw(soft)
         n = len(lines)
         x_end, y_last = 0.0, text_h - self.line_h + self.shift
+        any_soft = False
         for li, line in enumerate(lines):
             y = text_h - (n - li) * self.line_h + self.shift
             if y <= -self.line_h or y >= text_h:
                 continue
-            for x, i, _width in line:
+            for x, i, width in line:
                 w, style, born, since = shown[i]
                 k = _ease((now - born) / self.FADE) if now >= born else 0.0
                 if k <= 0:
                     continue
                 if k > 0.25:
-                    x_end, y_last = x + _width, y               # курсор — сразу за последним показанным
+                    x_end, y_last = x + width, y                # курсор — сразу за последним показанным
                 yy = y + (1 - k) * 4 * s
                 if style == "live":
                     dsoft.text((x, yy), w, font=self.f_main, fill=(236, 238, 245, int(235 * k)))
                     ds.text((x, yy), w, font=self.f_main, fill=(236, 238, 245, int(70 * k)))
+                    any_soft = True
                 elif style == "main":
                     kc = _ease((now - since) / self.SHARPEN)          # из размытого — в чёткий
                     if kc < 1:
                         dsoft.text((x, yy), w, font=self.f_main, fill=(245, 245, 247, int(235 * k * (1 - kc))))
+                        any_soft = True
                     ds.text((x, yy), w, font=self.f_main, fill=(245, 245, 247, int(255 * k * (0.27 + 0.73 * kc))))
                 else:
-                    col = self.COLORS[style]
-                    ds.text((x, yy), w, font=self.f_main, fill=(*col, int(255 * k)))
+                    ds.text((x, yy), w, font=self.f_main, fill=(*self.COLORS[style], int(255 * k)))
             if li == n - 1 and not line:                        # пустая строка после «новой строки»
                 x_end, y_last = 0.0, y
         layer = Image.new("RGBA", (text_w, text_h), (0, 0, 0, 0))
@@ -934,70 +943,17 @@ class AquaBubble(DictationBubble):
         ga = np.asarray(glow).copy()
         ga[..., 3] = (ga[..., 3] * 0.45).astype(np.uint8)
         layer.alpha_composite(Image.fromarray(ga, "RGBA"))
-        layer.alpha_composite(soft.filter(ImageFilter.GaussianBlur(1.7 * s)))
+        if any_soft:
+            layer.alpha_composite(soft.filter(ImageFilter.GaussianBlur(1.6 * s)))
         layer.alpha_composite(sharp)
         if n > self.MAX_LINES or self.shift > 1:                # верх растворяется, если строки уходят вверх
-            fade = int(12 * s)
+            fade = int(11 * s)
             a = np.asarray(layer).copy()
             ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
             a[:fade, :, 3] = (a[:fade, :, 3] * ramp).astype(np.uint8)
             layer = Image.fromarray(a, "RGBA")
-        tx, ty = bx0 + pad_x, by0 + pad_top
-        img.alpha_composite(layer, (tx, ty))
-        d = ImageDraw.Draw(img)
-
-        # курсор: синяя точка дышит в такт голосу; «уточняю» — фиолетовая
-        if self.state in ("rec", "busy"):
-            cx = tx + (x_end + int(13 * s) if x_end else int(7 * s))
-            cy = ty + min(max(y_last, 0), text_h - self.line_h) + self.line_h * 0.5   # не выходит за текст
-            if self.state == "busy":
-                col, r = (167, 139, 250), 6.5 * s * (0.85 + 0.15 * self.pulse)
-            else:
-                col, r = (59, 130, 246), 6.5 * s * (0.9 + 0.45 * self.level)
-            a = int(150 + 105 * self.pulse) if self.ready or self.state == "busy" else 110
-            g = Image.new("RGBA", (int(r * 6), int(r * 6)), (0, 0, 0, 0))
-            ImageDraw.Draw(g).ellipse((r * 1.5, r * 1.5, r * 4.5, r * 4.5), fill=(*col, a // 2))
-            g = g.filter(ImageFilter.GaussianBlur(r * 0.8))
-            img.alpha_composite(g, (int(cx - r * 3), int(cy - r * 3)))
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(*col, a))
-            d.ellipse((cx - r * 0.45, cy - r * 0.75, cx + r * 0.25, cy - r * 0.15), fill=(255, 255, 255, a // 3))
-
-        # нижняя полоска: значок, куда пишем, микрофон, «стоп»
-        sy = by1 - strip_h / 2
-        icon_r = 8 * s
-        ix = bx0 + int(20 * s)
-        d.ellipse((ix - icon_r, sy - icon_r, ix + icon_r, sy + icon_r), fill=(58, 58, 62, 255))
-        d.ellipse((ix - icon_r * 0.35, sy - icon_r * 0.55, ix + icon_r * 0.35, sy + icon_r * 0.25),
-                  fill=(200, 200, 206, 255))
-        d.arc((ix - icon_r * 0.6, sy - icon_r * 0.3, ix + icon_r * 0.6, sy + icon_r * 0.55), 20, 160,
-              fill=(200, 200, 206, 255), width=max(1, int(1.3 * s)))
-        right = bx1 - int(16 * s)
-        if self.state == "rec":
-            sr_ = 10 * s
-            scx = right - sr_
-            fill = (255, 69, 58, 255) if not self.hover_stop else (255, 99, 88, 255)
-            d.ellipse((scx - sr_, sy - sr_, scx + sr_, sy + sr_), fill=fill)
-            q = sr_ * 0.38
-            d.rounded_rectangle((scx - q, sy - q, scx + q, sy + q), radius=q * 0.3, fill=(255, 255, 255, 255))
-            self.stop_box = (int(scx - sr_ - 4 * s), int(sy - sr_ - 4 * s), int(scx + sr_ + 4 * s),
-                             int(sy + sr_ + 4 * s))
-            right = scx - sr_ - int(10 * s)
-        else:
-            self.stop_box = None
-        dim = (142, 142, 150, 255)
-        mic = self._fit(self.f_strip, self.mic, W * 0.32) if self.mic else ""
-        if mic:
-            mw = self.f_strip.getlength(mic)
-            d.text((right - mw, sy), mic, font=self.f_strip, fill=dim, anchor="lm")
-            right -= mw + int(14 * s)
-        if self.target:
-            left = ix + icon_r + int(14 * s)
-            text = self._fit(self.f_strip, "→  " + self.target, max(10, right - left))
-            d.text(((left + right) / 2, sy), text, font=self.f_strip, fill=dim, anchor="mm")
-
-        self._draw_badge(img, (bx0 + bx1) // 2, by0 - badge_h // 2)
-        self.last_size = (canvas[0], badge_h // 2 + box_h + 2 * margin)
-        return img
+        img.alpha_composite(layer, (bx0 + g["pad_x"], by0 + g["pad_top"]))
+        return img, x_end, y_last
 
 
 class CompactBubble(DictationBubble):

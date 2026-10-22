@@ -33,7 +33,6 @@ def save(bubble, name):
 d = AquaBubble(root, scale)
 _levels = iter([0.002, 0.004, 0.03, 0.06, 0.05, 0.08, 0.04] * 400)
 d.level_source = lambda: next(_levels, 0.05)
-d.set_context("Chrome: claude.ai", "Realtek Audio")
 d.set_state("rec", "ru")
 d.set_ready()
 d.set_text("Слушай, создай мне схему того, как вообще нужно начинать YouTube канал,",

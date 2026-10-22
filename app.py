@@ -78,7 +78,7 @@ from textproc import append_piece, apply_replacements, is_filler, parse_replacem
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
 APP_TITLE = "Голосовой помощник"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 HISTORY_MAX = 10
 
 
@@ -389,42 +389,6 @@ def foreground_elevated() -> bool:
         return False
 
 
-APP_NAMES = {"chrome": "Chrome", "msedge": "Edge", "firefox": "Firefox", "yandex": "Яндекс Браузер",
-             "browser": "Яндекс Браузер", "opera": "Opera", "telegram": "Telegram", "winword": "Word",
-             "excel": "Excel", "powerpnt": "PowerPoint", "outlook": "Outlook", "olk": "Outlook", "notepad": "Блокнот",
-             "code": "VS Code", "explorer": "Проводник", "discord": "Discord", "whatsapp": "WhatsApp",
-             "slack": "Slack", "teams": "Teams", "ms-teams": "Teams", "claude": "Claude", "obsidian": "Obsidian",
-             "notion": "Notion"}
-
-
-def foreground_title() -> str:
-    """Куда вставится текст: «Chrome: claude.ai», «Telegram», «Word: Отчёт» — для подписи в окошке."""
-    try:
-        hwnd = user32.GetForegroundWindow()
-        pid = ctypes.c_ulong()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == os.getpid():
-            return ""
-        import psutil
-        exe = Path(psutil.Process(pid.value).name()).stem
-        app = APP_NAMES.get(exe.lower(), exe[:1].upper() + exe[1:])
-        buf = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(hwnd, buf, 256)
-        title = re.split(r" [-—–|] ", buf.value.strip())[0].strip()
-        if not title or title.lower() == app.lower() or app.lower() in title.lower():
-            return app
-        return f"{app}: {title[:40]}"
-    except Exception:
-        return ""
-
-
-def short_mic_name(name: str) -> str:
-    """«Набор микрофонов (Realtek(R) Audio)» → «Realtek Audio», «Микрофон (AB13X USB Audio)» → «AB13X USB Audio»."""
-    name = re.sub(r"\((?:R|TM)\)", "", name or "").strip()
-    m = re.match(r"^(.*?)\s*\((.+)\)\s*$", name)
-    return (m.group(2) if m else name).strip()[:32]
-
-
 def foreground_is_ours() -> bool:
     pid = ctypes.c_ulong()
     user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
@@ -616,14 +580,13 @@ class Dictation:
     def _capture(self, q: queue.Queue, session: int):
         # (выключен ли микрофон, проверяется в главном потоке при нажатии Alt+Z — здесь только звук)
         heard = {"samples": 0, "peak": 0.0, "warned": False}
-        mic_name = [""]
 
         def callback(data, *_):
             if time.time() < self.listen_from:
                 return                                # ещё звучит сигнал «начали»
             block = data[:, 0].copy()
             if not heard["samples"]:
-                self._say(session, "dict_ready", mic_name[0])   # микрофон слушает — можно говорить
+                self._say(session, "dict_ready")      # микрофон слушает — можно говорить
             self.level = rms(block)
             q.put(block)
             heard["samples"] += len(block)
@@ -639,8 +602,7 @@ class Dictation:
             from audio_input import MicStream
             name = self.app.settings.get("mic", "")
             with MicStream(name, lambda block: callback(block[:, None])) as mic:
-                mic_name[0] = short_mic_name(mic.device_name)
-                log("микрофон:", mic.mode)
+                log("микрофон:", mic.mode, "—", mic.device_name)
                 while self.active and self.session == session:
                     time.sleep(0.03)
         except Exception as e:
@@ -1113,7 +1075,6 @@ class App:
         self.pills = {True: CompactBubble(root, self.scale), False: AquaBubble(root, self.scale)}
         for p in self.pills.values():
             p.level_source = lambda: self.dictation.level
-        self.pills[False].on_stop = lambda: self.ui("toggle")             # кнопка «стоп» в окошке
         SOUNDS["on"] = self.settings.get("sounds", True)
         self.pod_closed = False
         self.panel = LectureBubble(root, self.scale, on_close=lambda: self.ui("close_panel"),
@@ -1703,8 +1664,6 @@ class App:
                 self.layout_overlays()
         elif kind == "dict_ready":                  # микрофон открылся — индикатор голоса оживает
             self.pill.set_ready()
-            if args and args[0] and hasattr(self.pill, "set_context"):
-                self.pill.set_context(mic=args[0])
         elif kind == "dict_lang":                   # «Авто»: язык определён по голосу
             self.pill.set_lang(args[0])
         elif kind == "paste_blocked":
@@ -1839,8 +1798,6 @@ class App:
             self.mic_warning = False
             lang = self.dictation_lang()
             self.pill.set_state("rec", lang)
-            if hasattr(self.pill, "set_context"):
-                self.pill.set_context(target=foreground_title())
             loaded = lang in self.asr.models
             self.pill.set_text("", "", "Говорите…" if loaded else
                                "Говорите — распознавание ещё загружается, текст появится через пару секунд")

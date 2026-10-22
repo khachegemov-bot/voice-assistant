@@ -244,6 +244,9 @@ class Hero(tk.Canvas):
         self._job = None
         if not self.active:
             return
+        if not self.winfo_viewable():                   # окно спрятано — рисовать некому, только ждём
+            self._job = self.after(300, self._animate)
+            return
         try:
             self._frame = (self._frame + 1) % len(self.rings)
             self.itemconfigure("ring", image=self.rings[self._frame])
